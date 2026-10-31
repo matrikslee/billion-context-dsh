@@ -2,10 +2,8 @@
 
 [English](./README.en.md) | [中文](./README.md)
 
-> **🛑 This project is no longer maintained**
-> No further updates, bug fixes, or new features. For the same capability, use **[ranxianglei/billion-context](https://github.com/ranxianglei/billion-context)** — the unified upstream version, which natively supports the DeepSeek Harness (one implementation covers pi / OpenCode / Claude Code and 20+ other hosts).
-> Previously published versions remain installable, but are unsupported.
-
+> **This repo is a self-maintained fork**
+> The upstream [Tyan66666/billion-context-dsh](https://github.com/Tyan66666/billion-context-dsh) stopped being maintained in 2026-10 and points to the unified upstream [ranxianglei/billion-context](https://github.com/ranxianglei/billion-context). This fork keeps maintaining the **DSH-specific adapter layer**, updating the peer range and dependencies to the DSH host line; links to `Tyan66666/…` issues/PRs remain historical records of the upstream repo (those numbers do not exist here).
 > **⚠️ Beta notice — not for production use**
 > This project (**v0.2.27**) is a work-in-progress beta. The [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) itself is also in **public beta**. **Do not use either in engineering / production environments** — expect breaking changes and rough edges.
 
@@ -28,8 +26,8 @@ The model decides <em>when</em> and <em>what</em> to compress — not a hard lim
 
 <p align="center">
 <a href="https://www.npmjs.com/package/billion-context-dsh"><img src="https://img.shields.io/npm/v/billion-context-dsh.svg?style=flat-square" alt="npm"></a>
-<a href="https://github.com/Tyan66666/billion-context-dsh/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/billion-context-dsh.svg?style=flat-square" alt="license"></a>
-<a href="https://github.com/Tyan66666/billion-context-dsh"><img src="https://img.shields.io/badge/GitHub-Tyan66666%2Fbillion--context--dsh-181717?style=flat-square&logo=github" alt="GitHub"></a>
+<a href="https://github.com/matrikslee/billion-context-dsh/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="license"></a>
+<a href="https://github.com/matrikslee/billion-context-dsh"><img src="https://img.shields.io/badge/GitHub-matrikslee%2Fbillion-context-dsh-181717?style=flat-square&logo=github" alt="GitHub"></a>
 <a href="https://github.com/topics/dsh-plugin"><img src="https://img.shields.io/badge/topic-dsh--plugin-blue?style=flat-square" alt="dsh-plugin"></a>
 </p>
 
@@ -51,7 +49,7 @@ Unlike DSH's built-in auto-compaction (which replaces a range with an automatica
 - **Long tasks hold steady** — every step builds on the results before it; key conclusions stay usable and compound, so very long tasks actually finish
 - **Context stays lean** — every request rides on a small, distilled slice of context with only the key information; no bulk compression of large ranges, so details don't decay with it — and tokens stay low
 
-This is the DeepSeek Harness port of [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) (the Pi coding-agent adapter): the compression core ([acp-kernel](https://github.com/ranxianglei/acp-kernel)) is reused verbatim, and the adapter layer was rewritten against DSH's durable-surface model — see [docs](https://github.com/Tyan66666/billion-context-dsh/tree/main/docs) for the verified mapping.
+This is the DeepSeek Harness port of [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) (the Pi coding-agent adapter): the compression core ([acp-kernel](https://github.com/ranxianglei/acp-kernel)) is reused verbatim, and the adapter layer was rewritten against DSH's durable-surface model — see [docs](https://github.com/matrikslee/billion-context-dsh/tree/main/docs) for the verified mapping.
 
 ## Install
 
@@ -102,7 +100,7 @@ This only installs the package into your project/global store; it does **not** t
 **Install from the git source (`github:` spec — the form the plugin store shows).** The prebuilt `dist/` artifacts are committed to this repository, so a git-source install also works out of the box — **no build step needed**, and pnpm 11's default build-script blocking (`allowBuilds`) never applies to this package:
 
 ```bash
-dsh plugin --profile web add github:Tyan66666/billion-context-dsh#v0.2.27
+dsh plugin --profile web add github:matrikslee/billion-context-dsh#v0.2.28
 ```
 
 Prefer a `#<tag>` ref to get artifacts identical to that npm release; without a ref you get the latest default-branch build. Only building the repo yourself (`npm run build`) requires approving build scripts. Background and trade-offs: [docs/git-source-install-design.md](docs/git-source-install-design.md) (issue #92).

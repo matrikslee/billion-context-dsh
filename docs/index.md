@@ -20,7 +20,7 @@
 
 ## 🔗 Quick links
 
-- **Repository**: [github.com/Tyan66666/billion-context-dsh](https://github.com/Tyan66666/billion-context-dsh)
+- **Repository**: [github.com/matrikslee/billion-context-dsh](https://github.com/matrikslee/billion-context-dsh)
 - **npm**: [billion-context-dsh@0.2.25](https://www.npmjs.com/package/billion-context-dsh)
 - **Releases**: [GitHub Releases](https://github.com/Tyan66666/billion-context-dsh/releases)（全量历史、变更记录与致谢）
 - **Upstream**: [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) · [acp-kernel](https://github.com/ranxianglei/acp-kernel) · [opencode-acp](https://github.com/ranxianglei/opencode-acp) · [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)

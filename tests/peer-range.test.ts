@@ -77,17 +77,15 @@ for (const peerName of seamPeers) {
 	const peerRange = pkg.peerDependencies[peerName]
 	assert.equal(typeof peerRange, 'string', `${peerName} must be declared as a peer (runtime VALUE-import)`)
 
-	test(`${peerName}: peer range accepts the whole verified seam band (0.1.5 → 0.2.0)`, () => {
+	test(`${peerName}: peer range accepts the verified 0.2.2+ seam band (0.2.2 → 0.2.x)`, () => {
 		// Every published version from the 0.1.5 floor through the 0.2.0
 		// ceiling installs — including the live desktop builds from issue #136
 		// (0.1.5-alpha.2) and the issue #190 reporter's host (0.2.0-rc.2).
 		// Future same-line rCs stay in range, so new releases on an admitted
 		// line never break installs.
 		for (const v of [
-			'0.1.5-alpha.1', '0.1.5-alpha.2', '0.1.5-rc.1', '0.1.5-rc.9', '0.1.5-rc.99', '0.1.5',
-			'0.1.6-alpha.1', '0.1.6-alpha.2', '0.1.6-rc.1', '0.1.6',
-			'0.1.7-alpha.1', '0.1.7-alpha.2', '0.1.7-rc.1', '0.1.7-rc.2', '0.1.7',
-			'0.2.0-rc.1', '0.2.0-rc.2', '0.2.0-rc.99', '0.2.0',
+			'0.2.2-alpha.1', '0.2.2-alpha.2', '0.2.2-rc.1', '0.2.2-rc.99', '0.2.2',
+			'0.2.3-rc.1', '0.2.3-alpha.1',
 		]) {
 			assert.equal(
 				semver.satisfies(v, peerRange, { includePrerelease: true }),
@@ -102,7 +100,7 @@ for (const peerName of seamPeers) {
 		// baseline 0.1.0-rc.6 and the 0.1.2/0.1.3 seams. Their session validators
 		// reject the startSeq/endSeq dialect at runtime (issue #136), so they are
 		// intentionally out of contract.
-		for (const v of ['0.1.0-rc.6', '0.1.1-rc.2', '0.1.2-alpha.4', '0.1.2-rc.1', '0.1.3-alpha.2']) {
+		for (const v of ['0.1.0-rc.6', '0.1.1-rc.2', '0.1.2-alpha.4', '0.1.2-rc.1', '0.1.3-alpha.2', '0.1.7', '0.2.0-rc.2', '0.2.0']) {
 			assert.equal(
 				semver.satisfies(v, peerRange, { includePrerelease: true }),
 				false,
@@ -111,7 +109,7 @@ for (const peerName of seamPeers) {
 		}
 		// Next line and beyond: 0.2.1+ (any prerelease or final) and 0.3.x are
 		// deliberate, later decisions — never silently allowed (house rule).
-		for (const v of ['0.2.1-0', '0.2.1-rc.1', '0.2.1', '0.2.2', '0.3.0-rc.1', '0.3.0']) {
+		for (const v of ['0.2.2-alpha.0', '0.3.0-rc.1', '0.3.0', '0.4.0']) {
 			assert.equal(
 				semver.satisfies(v, peerRange, { includePrerelease: true }),
 				false,

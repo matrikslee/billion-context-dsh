@@ -2,10 +2,8 @@
 
 [中文](./README.md) | [English](./README.en.md)
 
-> **🛑 本项目已停止维护**
-> 不再更新、不再修复问题，也不再受理新功能请求。同类需求请改用 **[ranxianglei/billion-context](https://github.com/ranxianglei/billion-context)**——它已经是官方统一版，原生支持 DeepSeek Harness（同一套实现同时覆盖 pi / OpenCode / Claude Code 等二十多个宿主）。
-> 已发布的历史版本仍可安装使用，但不再提供支持。
-
+> **本仓是自维护分支（fork）**
+> 上游 [Tyan66666/billion-context-dsh](https://github.com/Tyan66666/billion-context-dsh) 已于 2026-10 停止维护并指向官方统一版 [ranxianglei/billion-context](https://github.com/ranxianglei/billion-context)。本分支继续维护 **DSH 专用适配层**，按 DSH 宿主版本更新 peer 范围与依赖；文中指向 `Tyan66666/…` 的 issue/PR 链接仍是上游仓库的历史记录（那些编号在本仓不存在）。
 > **⚠️ 测试版声明——请勿用于生产环境**
 > 本项目（**v0.2.27**）仍处于开发中的测试版。[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 本身也处于**公开测试版**阶段。**请勿将两者用于工程化 / 生产环境**——预期会有破坏性变更与粗糙之处。
 
@@ -28,8 +26,8 @@
 
 <p align="center">
 <a href="https://www.npmjs.com/package/billion-context-dsh"><img src="https://img.shields.io/npm/v/billion-context-dsh.svg?style=flat-square" alt="npm"></a>
-<a href="https://github.com/Tyan66666/billion-context-dsh/blob/main/LICENSE"><img src="https://img.shields.io/npm/l/billion-context-dsh.svg?style=flat-square" alt="license"></a>
-<a href="https://github.com/Tyan66666/billion-context-dsh"><img src="https://img.shields.io/badge/GitHub-Tyan66666%2Fbillion--context--dsh-181717?style=flat-square&logo=github" alt="GitHub"></a>
+<a href="https://github.com/matrikslee/billion-context-dsh/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="license"></a>
+<a href="https://github.com/matrikslee/billion-context-dsh"><img src="https://img.shields.io/badge/GitHub-matrikslee%2Fbillion-context-dsh-181717?style=flat-square&logo=github" alt="GitHub"></a>
 <a href="https://github.com/topics/dsh-plugin"><img src="https://img.shields.io/badge/topic-dsh--plugin-blue?style=flat-square" alt="dsh-plugin"></a>
 </p>
 
@@ -51,7 +49,7 @@
 - **长任务稳得住** —— 每一步都接着前面的成果走，关键结论持续可用、不断叠加，超长任务更容易跑完
 - **上下文始终精简** —— 每次请求都只用少量、精炼的上下文，只保留关键信息；不做大段统一压缩，细节不随之衰失，token 消耗自然更低
 
-这是 [billion-context-pi](https://github.com/ranxianglei/billion-context-pi)（Pi 编码代理适配器）在 DeepSeek Harness 上的移植：压缩内核（[acp-kernel](https://github.com/ranxianglei/acp-kernel)）原样复用，适配层针对 DSH 的 durable-surface 模型重写——经过验证的映射关系见 [docs](https://github.com/Tyan66666/billion-context-dsh/tree/main/docs)。
+这是 [billion-context-pi](https://github.com/ranxianglei/billion-context-pi)（Pi 编码代理适配器）在 DeepSeek Harness 上的移植：压缩内核（[acp-kernel](https://github.com/ranxianglei/acp-kernel)）原样复用，适配层针对 DSH 的 durable-surface 模型重写——经过验证的映射关系见 [docs](https://github.com/matrikslee/billion-context-dsh/tree/main/docs)。
 
 ## 安装
 
@@ -102,7 +100,7 @@ npm install billion-context-dsh
 **git 源安装（`github:` 规格，插件商店展示的形态）。** 预构建产物 `dist/` 已提交到仓库，从 git 源安装同样开箱即用——**无需任何构建步骤**，pnpm 11 默认拦截构建脚本（`allowBuilds`）的机制对这个包不构成障碍：
 
 ```bash
-dsh plugin --profile web add github:Tyan66666/billion-context-dsh#v0.2.27
+dsh plugin --profile web add github:matrikslee/billion-context-dsh#v0.2.28
 ```
 
 建议带 `#<tag>` 安装，拿到与对应 npm 版本完全一致的产物；不带 ref 则装默认分支的最新构建。只有 clone 仓库自行从源码构建（`npm run build`）才需要放行构建。背景与方案取舍见 [docs/git-source-install-design.md](docs/git-source-install-design.md)（issue #92）。
