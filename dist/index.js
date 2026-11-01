@@ -8527,10 +8527,19 @@ async function handleCompress(env, args, exec) {
   const rejectedNotes = [];
   const seenRangeKeys = /* @__PURE__ */ new Set();
   const duplicateRangeNotes = [];
+  const swappedNotes = [];
   const guardedSeqs = guardedSurfaceSeqsOf(session);
   for (const range of args.content) {
-    const startSeq = parseBoundary2(range.startSeq, byRef, session);
-    const endSeq = parseBoundary2(range.endSeq, byRef, session);
+    let startSeq = parseBoundary2(range.startSeq, byRef, session);
+    let endSeq = parseBoundary2(range.endSeq, byRef, session);
+    if (startSeq > endSeq) {
+      swappedNotes.push(
+        `  seqs ${startSeq}..${endSeq} were reversed \u2014 swapped to ${endSeq}..${startSeq}`
+      );
+      const mirrored = startSeq;
+      startSeq = endSeq;
+      endSeq = mirrored;
+    }
     let resolved;
     try {
       resolved = resolveSurfaceRange(session, startSeq, endSeq);
@@ -8588,7 +8597,7 @@ async function handleCompress(env, args, exec) {
     });
   }
   if (ranges.length === 0) {
-    const text = ["Compressed 0 block(s), ~0 tokens reclaimed.", ...alreadyCompressedNotes, ...duplicateRangeNotes, ...rejectedNotes];
+    const text = ["Compressed 0 block(s), ~0 tokens reclaimed.", ...swappedNotes, ...alreadyCompressedNotes, ...duplicateRangeNotes, ...rejectedNotes];
     if (alreadyCompressedNotes.length > 0) {
       text.push("  (all requested ranges were already compressed \u2014 decompress a block to recover its originals)");
     } else if (duplicateRangeNotes.length > 0 && rejectedNotes.length === 0) {
@@ -8690,6 +8699,7 @@ async function handleCompress(env, args, exec) {
     ...alreadyCompressedNotes,
     ...duplicateRangeNotes,
     ...rejectedNotes,
+    ...swappedNotes,
     ...lines
   ];
   const footer = totalSkipped > 0 ? `  (${totalSkipped} range(s) skipped or failed \u2014 see above)` : "";
@@ -9185,12 +9195,15 @@ function compressText(env, agent, args) {
   if (args.length < 3) {
     return "/acp-prune compress <startSeq> <endSeq> <summary...>";
   }
-  const startSeq = Number(args[0]);
-  const endSeq = Number(args[1]);
+  const rawStart = Number(args[0]);
+  const rawEnd = Number(args[1]);
   const summary = args.slice(2).join(" ");
-  if (!Number.isInteger(startSeq) || !Number.isInteger(endSeq)) {
+  if (!Number.isInteger(rawStart) || !Number.isInteger(rawEnd)) {
     return "/acp-prune compress: startSeq and endSeq must be integers";
   }
+  const swapped = rawStart > rawEnd;
+  const startSeq = swapped ? rawEnd : rawStart;
+  const endSeq = swapped ? rawStart : rawEnd;
   const session = agent.session;
   const { start, end } = resolveSurfaceRange(session, startSeq, endSeq);
   if (blockRefForSummarySeq(session, start) !== null || blockRefForSummarySeq(session, end) !== null) {
@@ -9216,7 +9229,7 @@ function compressText(env, agent, args) {
     provider,
     model
   });
-  return `Compressed seqs ${start}..${end} (${shadowed.length} messages) as block ${compactionId.slice(0, 8)}`;
+  return `Compressed seqs ${start}..${end} (${shadowed.length} messages) as block ${compactionId.slice(0, 8)}${swapped ? ` (args ${rawStart}..${rawEnd} were reversed \u2014 swapped)` : ""}`;
 }
 var DECOMPRESS_USAGE = "/acp-prune decompress <blockId> [offset] [limit]";
 function decompressText(_env, agent, args) {
@@ -9380,6 +9393,40 @@ async function configText(env, rest) {
     return configResetText(surface, args[1] ?? "all");
   }
   return `unknown /acp-prune config verb "${verb}" \u2014 use list | set <key> <value> | reset <key>|all`;
+}
+
+// src/registration.ts
+var ACP_TOOL_NAMES2 = ["compress", "decompress", "search_context", "acp_status"];
+var ACP_COMMAND_NAME = "acp-prune";
+function shouldRestoreTool(tools, agent, name) {
+  if (tools.get === void 0) return false;
+  if (tools.get(name, agent) !== void 0) return false;
+  return tools.get(name) === void 0;
+}
+function healRegistrations(env, tools, commands, agent) {
+  const result = { tools: [], command: false };
+  if (tools !== void 0) {
+    let definitions;
+    for (const name of ACP_TOOL_NAMES2) {
+      if (!shouldRestoreTool(tools, agent, name)) continue;
+      definitions ??= new Map(makeTools(env).map((definition2) => [definition2.name, definition2]));
+      const definition = definitions.get(name);
+      if (definition === void 0) continue;
+      try {
+        tools.register(definition);
+        result.tools.push(name);
+      } catch {
+      }
+    }
+  }
+  if (commands !== void 0 && commands.find !== void 0 && commands.find(agent, ACP_COMMAND_NAME) === void 0) {
+    try {
+      commands.register(acpCommand(env));
+      result.command = true;
+    } catch {
+    }
+  }
+  return result;
 }
 
 // src/system-prompt.ts
@@ -9652,6 +9699,12 @@ var AcpCompactionEngine = class extends CompactionEngine {
     ctx.on("agent/pre-step", async (payload, next) => {
       stripOrphanedSurfaceToolMessages(payload.agent.session);
       engine.resyncSettings();
+      const healed = healRegistrations(env, ctx.get("tools"), ctx.get("commands"), payload.agent);
+      if (healed.tools.length > 0 || healed.command) {
+        ctx.logger.warn(
+          `billion-context-dsh: re-registered ${healed.tools.join(", ")}${healed.command ? " + /acp-prune" : ""} on session ${payload.agent.session.id} \u2014 the host registry was rebuilt since activation`
+        );
+      }
       if (!engine.readSettingsSource().autoNudge) return next();
       const decision = await next();
       if (decision.kind === "reject") return decision;

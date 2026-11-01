@@ -5,7 +5,7 @@
 > **本仓是自维护分支（fork）**
 > 上游 [Tyan66666/billion-context-dsh](https://github.com/Tyan66666/billion-context-dsh) 已于 2026-10 停止维护并指向官方统一版 [ranxianglei/billion-context](https://github.com/ranxianglei/billion-context)。本分支继续维护 **DSH 专用适配层**，按 DSH 宿主版本更新 peer 范围与依赖；文中指向 `Tyan66666/…` 的 issue/PR 链接仍是上游仓库的历史记录（那些编号在本仓不存在）。
 > **⚠️ 测试版声明——请勿用于生产环境**
-> 本项目（**v0.2.27**）仍处于开发中的测试版。[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 本身也处于**公开测试版**阶段。**请勿将两者用于工程化 / 生产环境**——预期会有破坏性变更与粗糙之处。
+> 本项目（**v0.2.29**）仍处于开发中的测试版。[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 本身也处于**公开测试版**阶段。**请勿将两者用于工程化 / 生产环境**——预期会有破坏性变更与粗糙之处。
 
 <p align="center">
 <strong>衷心感谢以下项目——请给它们一个 ⭐：</strong>
@@ -100,7 +100,7 @@ npm install billion-context-dsh
 **git 源安装（`github:` 规格，插件商店展示的形态）。** 预构建产物 `dist/` 已提交到仓库，从 git 源安装同样开箱即用——**无需任何构建步骤**，pnpm 11 默认拦截构建脚本（`allowBuilds`）的机制对这个包不构成障碍：
 
 ```bash
-dsh plugin --profile web add github:matrikslee/billion-context-dsh#v0.2.28
+dsh plugin --profile web add github:matrikslee/billion-context-dsh#v0.2.29
 ```
 
 建议带 `#<tag>` 安装，拿到与对应 npm 版本完全一致的产物；不带 ref 则装默认分支的最新构建。只有 clone 仓库自行从源码构建（`npm run build`）才需要放行构建。背景与方案取舍见 [docs/git-source-install-design.md](docs/git-source-install-design.md)（issue #92）。
@@ -279,7 +279,7 @@ DSH 的每个模型请求都派生自其 append-only 会话日志（*surface*）
 
 ## 已修复的问题
 
-> 下面这条是本项目自己撞出来的真实故障。已在内核 **acp-kernel 0.0.101** 修复，本仓 **v0.2.27** 起 pin 到该版本；老版本（≤ v0.2.26）仍会遇到。
+> 下面各条都是本项目自己撞出来的真实故障（v0.2.29 起修复，除非另有说明）。
 
 ### 长会话撞上内核引用上限：`ref capacity exhausted: cannot allocate beyond m99999`（已修复）
 
@@ -291,6 +291,14 @@ ref capacity exhausted: cannot allocate beyond m99999
 ```
 
 这是上游 [acp-kernel](https://github.com/ranxianglei/acp-kernel) 的 5 位引用编号空间（`m00001`–`m99999`）被**累计**见过的消息数耗尽——引用编号在会话内只增不复用（#176 的槽复用因会让摘要里的旧 tag 静默指向另一条消息而被 #191 回退，#191 确立该不变量），与当前上下文大小无关。当时确认内核 0.0.29、本仓当时 pin 的 0.0.63、以及当时的 npm 最新版 0.0.98 全部同样命中（`refs.ts` 的 `MAX_INDEX = 99999`）。**已在 acp-kernel 0.0.101 修复**：两版 `dist/index.js` 的常量实测为 `99999` → `9999999`，本仓 v0.2.27 起 pin 到该版本——**升级到 v0.2.27 及以上即不再撞限，旧会话无需重建**。
+
+### 续跑会话头几步全部 `unknown tool`：注册层随宿主注册表重建而丢失（v0.2.29 修复）
+
+被中断的 agent 循环重新继续时，头几个 step 的工具面里没有 `compress` / `decompress` / `search_context` / `acp_status`，模型每次调用都得到 `unknown tool`；等到插件实例被重新挂载才自愈（实测：缺工具窗口 = 前 2 个 step）。原因：`tools.register()` 是宿主 `layers.effect(ctx, …)` 的**层效果**，贡献挂在**接收注册的注册表实例**上；宿主重建 agent realm 时注册表被换成空实例，而插件实例仍在（激活期的 `done` 守卫禁止第二次尝试）。现在 `agent/pre-step` 每次都会核对本次 step 的工具面（`tools.get(name, agent)` 与全局视图**都**为空才算丢失），当场重新注册并在同一步生效；作用域级的 `tools.restrict()` 屏蔽不误判为丢失，因此不会每步重复插入。实现 `src/registration.ts`，回归 `tests/registration-heal.test.ts`。
+
+### `compress` 传反了边界不再报错（v0.2.29）
+
+`startSeq > endSeq` 是模型的笔误而不是非法区间：同一段内容换过来就是它想压的区间。实测一个会话窗口内出现 8 次 `reversed range` 拒绝，每次都白烧一轮重试。现在工具与 `/acp-prune compress` 都会自动交换边界并在结果里明示（`seqs X..Y were reversed — swapped to Y..X`），`resolveSurfaceRange` 的 `start ≤ end` 不变量保持不变。回归 `tests/tools.test.ts`。
 
 **压缩救不回，重启也救不回**：本插件每轮把**整条日志**（含已被摘要遮蔽的部分）交给内核（T2/T3 蒸馏需要完整日志而不只是可见面——见 src/messages.ts:315 `allLogMessages` 的注释），而内核流水线的第一个节点就是 `assign-refs`，先给日志里的所有消息编号、然后才谈任何压缩决策。所以：
 

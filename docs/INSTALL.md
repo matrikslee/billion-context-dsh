@@ -11,7 +11,9 @@ mkdir -p ~/.dsh/profiles/web/node_modules
 ln -s /Users/yintianan/GitHub/billion-context-dsh ~/.dsh/profiles/web/node_modules/billion-context-dsh
 ```
 
-依赖说明：`dist/index.js` 内联了 acp-kernel，运行时把五个 seam 包 `@deepseek-ai/dsh-compaction`、`@deepseek-ai/dsh-session`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-settings` 作为**外部依赖**（由 `devDependencies` 提供并同时声明为 `peerDependencies`，`billion-context-dsh/node_modules` 已在解析链上）；`@deepseek-ai/cordis` 与 `@deepseek-ai/schemastery` 同为 peer。这五个 seam 包共享同一个 **peer 范围** `>=0.1.5-alpha.1 <0.2.1-0`——覆盖所有已验证的版本线：`0.1.5` 下限加已验证的 `0.1.6` / `0.1.7` / `0.2.0` 线（各线全部预发布加最终版）。从 `0.1.5` 线起，会话 replace 操作的协议字段由 `{ op, start, end }` 改名为 `{ op, startSeq, endSeq }` 且校验严格（只接受这三个字段）；本引擎只输出新形态，在更旧的 DSH（< 0.1.5）上每次 compress 都会被宿主在运行时拒绝（issue #136），因此旧版本不在兼容范围内——请先升级 DSH 再安装。显式区间（而非 caret）是有意为之：上界 `0.2.1-0` 挡住未经验证的下一版本线（house rule；原上界 `0.1.6-0` 在 #190 逐线验证后放宽）。`0.2.0` 线还改了两处读取形状（工具结果调用 id 提升到消息级、新增 `developer/message` 工具注册表行），引擎按线读取、单一构建服务全区间（issue #192）。五个包一并声明为 peer（而非只声明 `dsh-compaction`），是为了让安装在 pnpm 的集成/封存布局下仍能把它们解析到**宿主自己的副本**，而不是某个与宿主不一致的陈旧嵌套副本。
+依赖说明：`dist/index.js` 内联了 acp-kernel，运行时把五个 seam 包 `@deepseek-ai/dsh-compaction`、`@deepseek-ai/dsh-session`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-settings` 作为**外部依赖**（由 `devDependencies` 提供并同时声明为 `peerDependencies`，`billion-context-dsh/node_modules` 已在解析链上）；`@deepseek-ai/cordis` 与 `@deepseek-ai/schemastery` 同为 peer。这五个 seam 包共享同一个 **peer 范围** `>=0.2.2-alpha.1 <0.3.0-0`（本 fork 的已验证基线 = devDeps 钉住的 DSH `0.2.2-alpha.2` 线）。从 `0.1.5` 线起，会话 replace 操作的协议字段由 `{ op, start, end }` 改名为 `{ op, startSeq, endSeq }` 且校验严格（只接受这三个字段）；本引擎只输出新形态，在更旧的 DSH（< 0.1.5）上每次 compress 都会被宿主在运行时拒绝（上游 issue #136），因此旧版本不在兼容范围内——请先升级 DSH 再安装。显式区间（而非 caret）是有意为之：上界 `0.3.0-0` 挡住未经验证的下一版本线（house rule；区间随宿主基线逐线验证后移动）。`0.2.0` 线还改了两处读取形状（工具结果调用 id 提升到消息级、新增 `developer/message` 工具注册表行），引擎按线读取、单一构建服务全区间（上游 issue #192）。五个包一并声明为 peer（而非只声明 `dsh-compaction`），是为了让安装在 pnpm 的集成/封存布局下仍能把它们解析到**宿主自己的副本**，而不是某个与宿主不一致的陈旧嵌套副本。
+
+`@deepseek-ai/cordis` 的范围写作 `>=4.0.6-alpha.1 <5.0.0-0`（而不是 `^4.0.1`）：宿主预发布线（如 `4.0.6-alpha.1`）在**普通 semver** 下只被「同 `[major,minor,patch]` 元组且带预发布后缀」的比较符接受，`^4.0.1` / `>=4.0.1` 一律判 false ⇒ pnpm 的静态 peer 检查每次安装都会打 `✕ missing peer @deepseek-ai/cordis`。宿主自己的安装门禁是宽松的（`@deepseek-ai/dsh-app-boot/lib/index.js:399` 用 `{ includePrerelease: true }`），所以安装从来不受影响——这条范围改的是那条误导性警告，两种求值模式下都成立（钉在 `tests/peer-range.test.ts`）。
 
 ### 方式 B：打包安装（发布前验证）
 
@@ -56,7 +58,7 @@ dsh plugin --profile web add billion-context-dsh
 不受影响：
 
 ```bash
-dsh plugin --profile web add github:matrikslee/billion-context-dsh#v0.2.28
+dsh plugin --profile web add github:matrikslee/billion-context-dsh#v0.2.29
 ```
 
 建议带 `#<tag>`，拿到与对应 npm 版本完全一致的产物；不带 ref 则装默认分支的最新构建。

@@ -5,7 +5,7 @@
 > **This repo is a self-maintained fork**
 > The upstream [Tyan66666/billion-context-dsh](https://github.com/Tyan66666/billion-context-dsh) stopped being maintained in 2026-10 and points to the unified upstream [ranxianglei/billion-context](https://github.com/ranxianglei/billion-context). This fork keeps maintaining the **DSH-specific adapter layer**, updating the peer range and dependencies to the DSH host line; links to `Tyan66666/…` issues/PRs remain historical records of the upstream repo (those numbers do not exist here).
 > **⚠️ Beta notice — not for production use**
-> This project (**v0.2.27**) is a work-in-progress beta. The [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) itself is also in **public beta**. **Do not use either in engineering / production environments** — expect breaking changes and rough edges.
+> This project (**v0.2.29**) is a work-in-progress beta. The [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) itself is also in **public beta**. **Do not use either in engineering / production environments** — expect breaking changes and rough edges.
 
 <p align="center">
 <strong>Built with gratitude on top of these projects</strong> — please give them a ⭐:
@@ -100,7 +100,7 @@ This only installs the package into your project/global store; it does **not** t
 **Install from the git source (`github:` spec — the form the plugin store shows).** The prebuilt `dist/` artifacts are committed to this repository, so a git-source install also works out of the box — **no build step needed**, and pnpm 11's default build-script blocking (`allowBuilds`) never applies to this package:
 
 ```bash
-dsh plugin --profile web add github:matrikslee/billion-context-dsh#v0.2.28
+dsh plugin --profile web add github:matrikslee/billion-context-dsh#v0.2.29
 ```
 
 Prefer a `#<tag>` ref to get artifacts identical to that npm release; without a ref you get the latest default-branch build. Only building the repo yourself (`npm run build`) requires approving build scripts. Background and trade-offs: [docs/git-source-install-design.md](docs/git-source-install-design.md) (issue #92).
@@ -281,7 +281,7 @@ If you do not want to tune three percentages by hand, pick the nudge aggressiven
 
 ## Fixed issues
 
-> The item below is a real failure this project ran into. It is fixed in kernel **acp-kernel 0.0.101**, and this repo pins that version from **v0.2.27** on; older releases (≤ v0.2.26) still hit it.
+> Each item below is a real failure this project ran into (fixed from v0.2.29 unless noted otherwise).
 
 ### Long sessions hitting the kernel's ref cap: `ref capacity exhausted: cannot allocate beyond m99999` (fixed)
 
@@ -292,6 +292,14 @@ ref capacity exhausted: cannot allocate beyond m99999
 ```
 
 This is the upstream [acp-kernel](https://github.com/ranxianglei/acp-kernel) 5-digit ref space (`m00001`–`m99999`) being exhausted by the CUMULATIVE number of messages ever seen — ref numbers are never reused within a session (#176's slot recycling was reverted by #191 because reused refs let stale tags in summary text silently point at another message; #191 established the invariant), so it is unrelated to current context size. Back then it was confirmed on kernel 0.0.29, on the version pinned here at the time (0.0.63) and on the then-latest npm release (0.0.98) — every line carried `const MAX_INDEX = 99999`. **Fixed in acp-kernel 0.0.101**: the constant measured `99999` → `9999999` across the two `dist/index.js` builds, and this repo pins it from v0.2.27 on — **upgrade to v0.2.27 or later and the cap is gone; existing sessions keep working**.
+
+### Every call answered `unknown tool` in the first steps of a resumed session (fixed in v0.2.29)
+
+When an interrupted agent loop was resumed, the first steps ran with a tool surface that had no `compress` / `decompress` / `search_context` / `acp_status`, so every model call came back `unknown tool`; it healed itself only once a fresh plugin instance mounted (measured: a 2-step gap). Cause: `tools.register()` is a host `layers.effect(ctx, …)` call — the contribution lives on the REGISTRY INSTANCE that received it. When the host rebuilds an agent realm the registry is replaced by an empty instance while this plugin instance stays mounted, and the activation-time `done` guard forbids a second attempt. `agent/pre-step` now verifies the step's own surface (`tools.get(name, agent)` AND the global view both empty = really gone) and re-registers in the same step. A scope-local `tools.restrict()` mask is not mistaken for a lost registration, so nothing is re-inserted every step. Implementation `src/registration.ts`, regression `tests/registration-heal.test.ts`.
+
+### `compress` no longer rejects boundaries given in reverse order (v0.2.29)
+
+`startSeq > endSeq` is a model slip, not an illegal span — the same content with the edges swapped is what the caller meant. Measured: 8 `reversed range` rejections inside one live window, each one burning a retry turn. The tool and `/acp-prune compress` now swap the edges and say so (`seqs X..Y were reversed — swapped to Y..X`); `resolveSurfaceRange` keeps its `start ≤ end` invariant. Regression `tests/tools.test.ts`.
 
 **Neither compression nor a restart recovers it**: this plugin feeds the FULL LOG (including everything shadowed by summaries) to the kernel on every turn (T2/T3 distillation requires the complete log, not just the visible surface — see the comment on `allLogMessages` at src/messages.ts:315), and the FIRST node of the kernel pipeline is `assign-refs`, which numbers every message in that log before any compression decision. So:
 

@@ -129,3 +129,37 @@ test('every runtime VALUE-imported seam package is declared as a peer', () => {
 		assert.equal(typeof pkg.peerDependencies[name], 'string', `${name} must be a peer (runtime VALUE-import)`)
 	}
 })
+
+test('cordis peer range admits the host prerelease line under BOTH semver modes', () => {
+	// cordis is a peer too, but it moves on its own 4.x line, so it needs its
+	// own band. Measured 2026-11-01 on the live host: it ships cordis
+	// `4.0.6-alpha.1`, and the OLD range `^4.0.1` did NOT satisfy that under
+	// plain semver (a prerelease only satisfies a comparator carrying a
+	// prerelease of the same [major,minor,patch] tuple) — `>=4.0.1`,
+	// `>=4.0.1-0` and `>=4.0.1 <5.0.0` were all `false`. The host's install
+	// gate is lenient (`@deepseek-ai/dsh-app-boot/lib/index.js:399` calls
+	// `semver.satisfies(version, range, { includePrerelease: true })`), so
+	// installs worked, but pnpm's own static peer check speaks plain semver and
+	// printed `✕ missing peer @deepseek-ai/cordis` on every install. Naming the
+	// verified tuple in the band satisfies both evaluation modes; the ceiling
+	// stays explicit so an unverified 5.x line is never silently admitted.
+	const range = pkg.peerDependencies['@deepseek-ai/cordis']
+	assert.equal(typeof range, 'string', '@deepseek-ai/cordis must be declared as a peer')
+	for (const v of ['4.0.6-alpha.1', '4.0.6-alpha.9', '4.0.6', '4.1.0', '4.9.9']) {
+		assert.equal(semver.satisfies(v, range), true, `${v} must satisfy ${range} under plain semver`)
+		assert.equal(
+			semver.satisfies(v, range, { includePrerelease: true }),
+			true,
+			`${v} must satisfy ${range} under the host gate's includePrerelease mode`,
+		)
+	}
+	// Out of contract: older cordis (below the verified baseline) and the next
+	// major line — both deliberate rejections, not accidents.
+	for (const v of ['4.0.5', '3.9.9', '5.0.0-rc.1', '5.0.0']) {
+		assert.equal(
+			semver.satisfies(v, range, { includePrerelease: true }),
+			false,
+			`${v} must NOT satisfy ${range}`,
+		)
+	}
+})
