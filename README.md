@@ -5,7 +5,7 @@
 > **本仓是自维护分支（fork）**
 > 上游 [Tyan66666/billion-context-dsh](https://github.com/Tyan66666/billion-context-dsh) 已于 2026-10 停止维护并指向官方统一版 [ranxianglei/billion-context](https://github.com/ranxianglei/billion-context)。本分支继续维护 **DSH 专用适配层**，按 DSH 宿主版本更新 peer 范围与依赖；文中指向 `Tyan66666/…` 的 issue/PR 链接仍是上游仓库的历史记录（那些编号在本仓不存在）。
 > **⚠️ 测试版声明——请勿用于生产环境**
-> 本项目（**v0.2.29**）仍处于开发中的测试版。[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 本身也处于**公开测试版**阶段。**请勿将两者用于工程化 / 生产环境**——预期会有破坏性变更与粗糙之处。
+> 本项目（**v0.2.30**）仍处于开发中的测试版。[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 本身也处于**公开测试版**阶段。**请勿将两者用于工程化 / 生产环境**——预期会有破坏性变更与粗糙之处。
 
 <p align="center">
 <strong>衷心感谢以下项目——请给它们一个 ⭐：</strong>
@@ -100,7 +100,7 @@ npm install billion-context-dsh
 **git 源安装（`github:` 规格，插件商店展示的形态）。** 预构建产物 `dist/` 已提交到仓库，从 git 源安装同样开箱即用——**无需任何构建步骤**，pnpm 11 默认拦截构建脚本（`allowBuilds`）的机制对这个包不构成障碍：
 
 ```bash
-dsh plugin --profile web add github:matrikslee/billion-context-dsh#v0.2.29
+dsh plugin --profile web add github:matrikslee/billion-context-dsh#v0.2.30
 ```
 
 建议带 `#<tag>` 安装，拿到与对应 npm 版本完全一致的产物；不带 ref 则装默认分支的最新构建。只有 clone 仓库自行从源码构建（`npm run build`）才需要放行构建。背景与方案取舍见 [docs/git-source-install-design.md](docs/git-source-install-design.md)（issue #92）。
@@ -252,6 +252,7 @@ DSH 的每个模型请求都派生自其 append-only 会话日志（*surface*）
 | `autoNudge` | `true` | 当内核建议时向 `agent/pre-step` 注入 nudge（运行时热调：`/acp-prune config`） |
 | `maxOverflowRetries` | `1` | 宿主确认的上下文超窗（`CONTEXT_WINDOW_EXCEEDED`）自动抢救预算：超窗时引擎挑一段**最大且合规**的范围做一次紧急压缩（摘要是引擎自己写的标记，不调模型——请求刚被拒，本就没有模型回合可写摘要；原文都留在日志里，`search_context`/`decompress` 找得回来），然后应答宿主的 `agent/request-error` 让该请求重试。预算按请求计数，模型有进展（落一条 assistant 消息）或 agent 回到 idle 即重置；`0` 关闭这个自动动作（错误原样抛给用户）。这是 ACP 唯一的自动压缩动作——压力侧始终只 nudge、由模型决定（组合行专用，不进 settings 层；原理与取舍见 [docs/overflow-recovery-design.md](docs/overflow-recovery-design.md)） |
 | `settingsEnabled` | `true`（未配置即启用） | （可选）整体关闭运行时设置集成（组合行专用，不进 settings 层——开关不能关掉自己；关闭后组合行 `config:` 仍是唯一生效通道） |
+| `toolCallStyle` | `auto` | （可选）模型**怎么够到**这四个工具：`auto` 每步从宿主装配出的 system prompt 里认出 PTC / code mode（宿主自己的常量串，TS 与 Python SDK 都命中）并就地把调用形状换成 `await tools.compress({…})`；`native` / `ptc` 钉死，用于检测失效时人工纠正。PTC 下直调不报错也不产生调用（标记落成裸文本），所以文案形状就是唯一可学习的信号（组合行专用，不进 settings 层；见 `src/ptc.ts` 与「已修复的问题」） |
 | `prompts` | — | （可选）自定义提示词文案：nudge / 范围表 / system prompt / 工具描述按槽位覆盖（模板 + 命名占位符，构造期校验；见上文「自定义提示词文案」与 [docs/configurable-prompts-design.md](docs/configurable-prompts-design.md)） |
 
 ## 预设（preset）
@@ -279,7 +280,7 @@ DSH 的每个模型请求都派生自其 append-only 会话日志（*surface*）
 
 ## 已修复的问题
 
-> 下面各条都是本项目自己撞出来的真实故障（v0.2.29 起修复，除非另有说明）。
+> 下面各条都是本项目自己撞出来的真实故障（截至 v0.2.30 已修复，除非另有说明）。
 
 ### 长会话撞上内核引用上限：`ref capacity exhausted: cannot allocate beyond m99999`（已修复）
 
@@ -299,6 +300,10 @@ ref capacity exhausted: cannot allocate beyond m99999
 ### `compress` 传反了边界不再报错（v0.2.29）
 
 `startSeq > endSeq` 是模型的笔误而不是非法区间：同一段内容换过来就是它想压的区间。实测一个会话窗口内出现 8 次 `reversed range` 拒绝，每次都白烧一轮重试。现在工具与 `/acp-prune compress` 都会自动交换边界并在结果里明示（`seqs X..Y were reversed — swapped to Y..X`），`resolveSurfaceRange` 的 `start ≤ end` 不变量保持不变。回归 `tests/tools.test.ts`。
+
+### PTC（code mode）下 `compress` 输出成裸文本、什么都没发生（v0.2.30 修复）
+
+宿主挂载 PTC 执行器时，工具面收成**一条总线**：`run_code` 是唯一可直接调用的工具，其余工具只能在 `run_code` 程序里经 SDK 访问（`await tools.compress({ … })`）。本插件的提示文案按直调形状写，模型照抄成直调 `compress`；引擎把不认识的函数名当**普通文本**落下——没有 `tool/call` 事件、没有错误结果、没有任何可学习的信号（实测：泄漏的调用标记留在一个孤立 `text` 块里，模型自己得出「压缩坏了」并放弃尝试；同会话其他 75 次 PTC 派发全部成功，说明总线没问题，坏的只是这条路径）。现在：从宿主自己的常量串识别模式（`is the only tool you can call directly`、`## Writing code for run_code`，TS/Python SDK 都命中），把**模型可见的调用形状就地改写**成 SDK 形式（不是追加段落——每字节每次请求都计费），`agent/pre-step` 判定并在翻转时**先释放再重注册**工具与系统提示段（`register()` / `section()` 返回各自的 disposer，避免每次翻转叠一层），检测到泄漏调用时在下一次 nudge 上带一行纠正（每会话 ≤3 次）。原生模式文案逐字节不变。可用 `toolCallStyle: auto|native|ptc` 钉住。实现 `src/ptc.ts`，回归 `tests/prompts-ptc.test.ts`。
 
 **压缩救不回，重启也救不回**：本插件每轮把**整条日志**（含已被摘要遮蔽的部分）交给内核（T2/T3 蒸馏需要完整日志而不只是可见面——见 src/messages.ts:315 `allLogMessages` 的注释），而内核流水线的第一个节点就是 `assign-refs`，先给日志里的所有消息编号、然后才谈任何压缩决策。所以：
 

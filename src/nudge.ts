@@ -36,6 +36,7 @@ import { mediaPriceViaMeter } from './host-tokens.ts'
 import { sessionEventsOf } from './session-events.ts'
 import { kernelConfigFor, type KernelConfigInput } from './config.ts'
 import { DEFAULT_RESOLVED, renderTemplate, type ResolvedPrompts } from './prompts.ts'
+import { PTC_LEAK_CORRECTION, ptcText, type ResolvedCallStyle } from './ptc.ts'
 
 /**
  * B6 nudge 瘦身（2026-09-08 方案 §4 B6）：哲学段与压缩规则段**移出 nudge**——
@@ -63,6 +64,12 @@ export interface NudgeEnvironment extends KernelConfigInput {
   readonly store: AcpStateStore
   /** Resolved prompt templates (optional: falls back to DEFAULT_RESOLVED). */
   readonly prompts?: ResolvedPrompts
+  /** How the model can REACH these tools this step (src/ptc.ts); default `native`.
+   *  `prompts` must already be the matching variant — the engine swaps both
+   *  together in `applyToolCallStyle`. */
+  readonly toolCallStyle?: ResolvedCallStyle
+  /** Append the one-shot direct-call correction (a leaked XML call was seen). */
+  readonly ptcLeakNote?: boolean
 }
 
 export interface NudgeOutcome {
@@ -341,6 +348,7 @@ export function buildNudge(
     }
   }
 
+  const style: ResolvedCallStyle = env.toolCallStyle ?? 'native'
   const text = buildNudgeText(
     nudge,
     emergency,
@@ -348,6 +356,10 @@ export function buildNudge(
     kernelRangeViewOf(nudge, turn.state),
     env.prompts,
     mediaPriceOf,
+    style,
+    // The correction rides the nudge the engine is already injecting — no extra
+    // message, no extra injection surface (the leak is otherwise silent).
+    style === 'ptc' && env.ptcLeakNote === true,
   )
   const message = createUserMessage({
     content: [{ type: 'text', text }],
@@ -382,15 +394,20 @@ export function buildNudgeText(
   kernelView: KernelRangeView,
   prompts: ResolvedPrompts = DEFAULT_RESOLVED,
   mediaPriceOf?: MediaPriceOf,
+  style: ResolvedCallStyle = 'native',
+  leakNote = false,
 ): string {
   // A host override of any nudge slot → template rendering (config.prompts
   // keeps its v0.1.9 contract: custom copy wins). Only the pristine default
   // reference reaches the kernel path.
-  if (prompts.nudge !== DEFAULT_RESOLVED.nudge) {
-    return renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf)
-  }
-  const rendered = renderNudgeText(nudge)
-  return adaptKernelNudgeToSeq(rendered.text, nudge, session, kernelView, prompts, mediaPriceOf)
+  const text = prompts.nudge !== DEFAULT_RESOLVED.nudge
+    ? renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf, style)
+    : adaptKernelNudgeToSeq(renderNudgeText(nudge).text, nudge, session, kernelView, prompts, mediaPriceOf, style)
+  // A leaked direct call produced no call and no error (its markup landed as
+  // assistant text), so the nudge we are already injecting is the only channel
+  // that can name the failure. Gated on the mode: in native mode the direct
+  // shape works, so the flag means nothing there.
+  return leakNote && style === 'ptc' ? `${text}\n\n${PTC_LEAK_CORRECTION}` : text
 }
 
 /**
@@ -414,6 +431,7 @@ function adaptKernelNudgeToSeq(
   kernelView: KernelRangeView,
   prompts: ResolvedPrompts,
   mediaPriceOf?: MediaPriceOf,
+  style: ResolvedCallStyle = 'native',
 ): string {
   // B6：先摘掉哲学/规则段（它们住在系统提示与工具描述里），再做 seq 适配
   let out = stripNudgeGuidance(text)
@@ -424,15 +442,17 @@ function adaptKernelNudgeToSeq(
     out = replaceTierTrigger(out, nudge, session, prompts)
   } else if (out.includes('"startId"')) {
     // Emergency nudges: replace the ref-ID JSON example with a seq example.
-    out = replaceEmergencyExample(out)
+    out = replaceEmergencyExample(out, style)
   }
   // Replace the ref-ID range table (mNNNNN) with the surface-seq table.
   // A zero-range table leaves the kernel's own "[No specific ranges detected]"
   // notice intact — it is a better prompt than an empty table.
   const seqTable = rangeTable(session, kernelView, prompts, mediaPriceOf)
   if (seqTable !== '') out = replaceRangesStr(out, seqTable)
-  out = insertContentFormNote(out)
-  return out
+  out = insertContentFormNote(out, style)
+  // PTC: the kernel copy names the direct-call shape the host rejects, so the
+  // rendered text (not the kernel templates — rule 9) switches to the SDK form.
+  return ptcText(out, style)
 }
 
 /**
@@ -444,15 +464,23 @@ function adaptKernelNudgeToSeq(
  * difference in ONE line, placed BEFORE the tip so the tip stays the last
  * thing the model reads. Without it a model that follows the tip gets a schema
  * rejection it has to re-learn from mid-batch.
+ *
+ * In PTC mode the SAME line must name the reachable shape (`await tools.compress`)
+ * — the direct-call shape it otherwise teaches is the one the host rejects, and
+ * the failure is silent there (the call parses as text), so the copy is the only
+ * correction channel (src/ptc.ts).
  */
-const CONTENT_FORM_NOTE =
-  'Note: this tool takes the array form only — compress({ content: [{ startSeq, endSeq, summary }] }) with the surface seqs above; a plain-string content is rejected.'
+function contentFormNote(style: ResolvedCallStyle): string {
+  return style === 'ptc'
+    ? 'Note: this tool takes the array form only — call it from inside `run_code` as `await tools.compress({ content: [{ startSeq, endSeq, summary }] })` with the surface seqs above; a plain-string content is rejected and a direct `compress` call fails.'
+    : 'Note: this tool takes the array form only — compress({ content: [{ startSeq, endSeq, summary }] }) with the surface seqs above; a plain-string content is rejected.'
+}
 
 /** Insert the array-form note right before the kernel's closing tip (no tip → text unchanged). */
-function insertContentFormNote(text: string): string {
+function insertContentFormNote(text: string, style: ResolvedCallStyle): string {
   const tipAt = text.lastIndexOf('\n\n\u{1F4A1} ')
   if (tipAt === -1) return text
-  return text.slice(0, tipAt) + '\n\n' + CONTENT_FORM_NOTE + text.slice(tipAt)
+  return text.slice(0, tipAt) + '\n\n' + contentFormNote(style) + text.slice(tipAt)
 }
 
 /** Replace the kernel rangesStr segment (`Compressible ranges (N, oldest first):…`) with our seq table. */
@@ -503,15 +531,16 @@ function replaceTierTrigger(
 }
 
 /** Replace the kernel emergency JSON example (startId/endId) with a seq example. */
-function replaceEmergencyExample(text: string): string {
+function replaceEmergencyExample(text: string, style: ResolvedCallStyle = 'native'): string {
   const start = text.search(/\n\n\{ "topic":/)
   if (start === -1) return text
   const rest = text.slice(start + 2)
   const next = rest.match(/\n\nCompressible ranges |\n\n\[No specific/)
   const end = next !== null ? start + 2 + next.index! : text.length
-  return text.slice(0, start)
-    + '\n\ncompress({ content: [{ startSeq, endSeq, summary }] }) — use the seqs from the range table above.'
-    + text.slice(end)
+  const example = style === 'ptc'
+    ? '\n\nawait tools.compress({ content: [{ startSeq, endSeq, summary }] }) from inside `run_code` — use the seqs from the range table above.'
+    : '\n\ncompress({ content: [{ startSeq, endSeq, summary }] }) — use the seqs from the range table above.'
+  return text.slice(0, start) + example + text.slice(end)
 }
 
 /**
@@ -526,6 +555,7 @@ function renderNudgeFromTemplates(
   kernelView: KernelRangeView,
   prompts: ResolvedPrompts,
   mediaPriceOf?: MediaPriceOf,
+  style: ResolvedCallStyle = 'native',
 ): string {
   // Cap the reported percentage at 100: a broken measurement (e.g. response
   // pressure folded in) must never surface as an absurd "230%" to the model.
@@ -586,9 +616,9 @@ function renderNudgeFromTemplates(
   // Batch-compress tip (from kernel's nudge-text.ts style). The array-form
   // note rides with it on this path too — a host that overrides only the tip
   // must not lose the tool-contract line (same hole B6 closed for guidance).
-  if (prompts.nudge.tip !== '') parts.push('', CONTENT_FORM_NOTE, '', prompts.nudge.tip)
+  if (prompts.nudge.tip !== '') parts.push('', contentFormNote(style), '', prompts.nudge.tip)
 
   // B6：模板路径同样摘掉哲学/规则段——否则宿主只要覆盖任一 nudge 槽位（如只改 tip），
   // 整份 6 KB 指引就会重新贴回来（独立复核 2026-09-08 发现的软缺口）。
-  return stripNudgeGuidance(parts.join('\n'))
+  return ptcText(stripNudgeGuidance(parts.join('\n')), style)
 }

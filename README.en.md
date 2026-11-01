@@ -5,7 +5,7 @@
 > **This repo is a self-maintained fork**
 > The upstream [Tyan66666/billion-context-dsh](https://github.com/Tyan66666/billion-context-dsh) stopped being maintained in 2026-10 and points to the unified upstream [ranxianglei/billion-context](https://github.com/ranxianglei/billion-context). This fork keeps maintaining the **DSH-specific adapter layer**, updating the peer range and dependencies to the DSH host line; links to `Tyan66666/…` issues/PRs remain historical records of the upstream repo (those numbers do not exist here).
 > **⚠️ Beta notice — not for production use**
-> This project (**v0.2.29**) is a work-in-progress beta. The [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) itself is also in **public beta**. **Do not use either in engineering / production environments** — expect breaking changes and rough edges.
+> This project (**v0.2.30**) is a work-in-progress beta. The [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) itself is also in **public beta**. **Do not use either in engineering / production environments** — expect breaking changes and rough edges.
 
 <p align="center">
 <strong>Built with gratitude on top of these projects</strong> — please give them a ⭐:
@@ -100,7 +100,7 @@ This only installs the package into your project/global store; it does **not** t
 **Install from the git source (`github:` spec — the form the plugin store shows).** The prebuilt `dist/` artifacts are committed to this repository, so a git-source install also works out of the box — **no build step needed**, and pnpm 11's default build-script blocking (`allowBuilds`) never applies to this package:
 
 ```bash
-dsh plugin --profile web add github:matrikslee/billion-context-dsh#v0.2.29
+dsh plugin --profile web add github:matrikslee/billion-context-dsh#v0.2.30
 ```
 
 Prefer a `#<tag>` ref to get artifacts identical to that npm release; without a ref you get the latest default-branch build. Only building the repo yourself (`npm run build`) requires approving build scripts. Background and trade-offs: [docs/git-source-install-design.md](docs/git-source-install-design.md) (issue #92).
@@ -254,6 +254,7 @@ This project reuses `acp-kernel`'s compression core and `billion-context-pi`'s d
 | `autoNudge` | `true` | Inject the nudge into `agent/pre-step` (runtime-adjustable: `/acp-prune config`) |
 | `maxOverflowRetries` | `1` | Budget for automatic recovery from a provider-confirmed context overflow (`CONTEXT_WINDOW_EXCEEDED`): the engine hides the largest eligible range with a marker summary it writes itself (no model call — the request was just rejected, so there is no model turn to write one; every original stays in the session log and `search_context`/`decompress` find it again), then answers the host's `agent/request-error` so the request is retried. The budget counts per request and resets once the model makes progress (an assistant message lands) or the agent goes idle; `0` disables the automatic action (the error surfaces unchanged). This is ACP's ONLY automatic compaction action — the pressure side stays nudge-only, the model decides (composition-only, not in the settings layer; rationale and trade-offs in [docs/overflow-recovery-design.md](docs/overflow-recovery-design.md)) |
 | `settingsEnabled` | `true` (enabled when unset) | (optional) Disable the runtime-settings integration entirely (composition-row-only, deliberately NOT in the settings layer — the switch cannot turn itself off; with it off the composition-row `config:` stays the only effective channel) |
+| `toolCallStyle` | `auto` | (optional) How the model REACHES the four tools: `auto` detects PTC / code mode each step from the host's assembled system prompt (the host's own marker constants, matched in the TS and Python SDK alike) and rewrites call shapes in place into `await tools.compress({…})`; `native` / `ptc` pin it when detection is ever wrong. In PTC mode a direct call neither errors nor produces a call (the markup lands as bare text), so the copy's shape is the only learnable signal (composition-row-only, not in the settings layer; see `src/ptc.ts` and "Fixed issues") |
 | `prompts` | — | (optional) Custom prompt copy: per-slot overrides for nudge / range table / system prompt / tool descriptions (template + named placeholders, validated at construction; see “Custom prompt copy” above and [docs/configurable-prompts-design.md](docs/configurable-prompts-design.md)) |
 
 ## Presets
@@ -281,7 +282,7 @@ If you do not want to tune three percentages by hand, pick the nudge aggressiven
 
 ## Fixed issues
 
-> Each item below is a real failure this project ran into (fixed from v0.2.29 unless noted otherwise).
+> Each item below is a real failure this project ran into (fixed as of v0.2.30 unless noted otherwise).
 
 ### Long sessions hitting the kernel's ref cap: `ref capacity exhausted: cannot allocate beyond m99999` (fixed)
 
@@ -300,6 +301,10 @@ When an interrupted agent loop was resumed, the first steps ran with a tool surf
 ### `compress` no longer rejects boundaries given in reverse order (v0.2.29)
 
 `startSeq > endSeq` is a model slip, not an illegal span — the same content with the edges swapped is what the caller meant. Measured: 8 `reversed range` rejections inside one live window, each one burning a retry turn. The tool and `/acp-prune compress` now swap the edges and say so (`seqs X..Y were reversed — swapped to Y..X`); `resolveSurfaceRange` keeps its `start ≤ end` invariant. Regression `tests/tools.test.ts`.
+
+### `compress` emitted raw text and did nothing in PTC (code) mode (fixed in v0.2.30)
+
+With a PTC executor mounted, the host collapses the tool surface to ONE bus: `run_code` is the only directly callable tool, and everything else is reachable only through the SDK inside a `run_code` program (`await tools.compress({ … })`). Our prompt copy is written in direct-call shape, so the model copied it into a direct `compress` call — and the engine parsed the unknown function name as plain TEXT: no `tool/call` event, no error result, nothing to learn from (measured: the leaked markup sat in a lone `text` block and the model concluded on its own that compression was broken and stopped trying; the session's other 75 PTC dispatches all succeeded, so the bus was fine — only our path was broken). Now: the mode is detected from the host's own constants (`is the only tool you can call directly`, `## Writing code for run_code`, matching in the TS and Python SDK alike), every model-visible call shape is REWRITTEN in place into the SDK form (not appended — every byte is billed on every request), `agent/pre-step` resolves the mode and, on a flip, disposes then re-registers the tools and the system-prompt section (`register()` / `section()` each return their own disposer, so a flip replaces instead of stacking a layer), and a detected leak gets one correction line on the next nudge (≤3 per session). Native copy stays byte-identical. Pin it with `toolCallStyle: auto|native|ptc`. Implementation `src/ptc.ts`, regression `tests/prompts-ptc.test.ts`.
 
 **Neither compression nor a restart recovers it**: this plugin feeds the FULL LOG (including everything shadowed by summaries) to the kernel on every turn (T2/T3 distillation requires the complete log, not just the visible surface — see the comment on `allLogMessages` at src/messages.ts:315), and the FIRST node of the kernel pipeline is `assign-refs`, which numbers every message in that log before any compression decision. So:
 

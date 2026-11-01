@@ -45,6 +45,7 @@ import { allLogMessages, attachmentsOfEvent, buildToolCallIndex, eventsToCoreMes
 import { shadowedTokensViaMeter } from './host-tokens.ts'
 import { eventAtOf, sessionEventsOf } from './session-events.ts'
 import { DEFAULT_RESOLVED, type ResolvedPrompts } from './prompts.ts'
+import { callHint, type ResolvedCallStyle } from './ptc.ts'
 import type { SettingsCommandSurface } from './settings.ts'
 import type { PresetName } from './presets.ts'
 
@@ -57,6 +58,11 @@ export interface ToolEnvironment extends KernelConfigInput {
   readonly windowFor?: (agent: Agent) => Promise<AcpWindow>
   /** Resolved prompt templates (optional: falls back to DEFAULT_RESOLVED). */
   readonly prompts?: ResolvedPrompts
+  /** How the model can REACH these tools in the current step (src/ptc.ts). The
+   *  engine swaps in the PTC variant of `prompts` together with this, so the two
+   *  never disagree; a stand-in env (tests, plain compositions) defaults to
+   *  `native` and keeps the direct-call copy byte-identical. */
+  readonly toolCallStyle?: ResolvedCallStyle
   /**
    * Call ids of compress invocations that created a durable block. The engine
    * listens for the matching `tool/result` and hides the call/result pair from
@@ -593,7 +599,7 @@ async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: To
   const unwrapped = unwrapCompressArgs(args)
   if (unwrapped === null) {
     return {
-      text: 'compress: missing content — pass the content array directly: compress({ content: [{ startSeq, endSeq, summary }] })',
+      text: `compress: missing content — pass the content array directly: ${callHint(env.toolCallStyle ?? 'native', 'compress', '{ content: [{ startSeq, endSeq, summary }] }')}`,
     }
   }
   args = unwrapped
@@ -1062,7 +1068,7 @@ export function buildSearchDocs(session: Session): SearchDoc[] {
   return docs
 }
 
-function handleSearch(_env: ToolEnvironment, rawArgs: SearchArgs, exec: ToolRunContext): TextOutput {
+function handleSearch(env: ToolEnvironment, rawArgs: SearchArgs, exec: ToolRunContext): TextOutput {
   const args = unwrapEnvelope<SearchArgs>(rawArgs)
   const session = requireAgent(exec).session
   if (args.query.trim() === '') return { text: 'search_context: empty query (no matches)' }
@@ -1078,7 +1084,7 @@ function handleSearch(_env: ToolEnvironment, rawArgs: SearchArgs, exec: ToolRunC
     return `  - ${kind} (score ${r.score.toFixed(2)}): ${r.preview}`
   })
   return {
-    text: `Matches for "${args.query}":\n${lines.join('\n')}\n\nDecompress with: decompress({ blockId })`,
+    text: `Matches for "${args.query}":\n${lines.join('\n')}\n\nDecompress with: ${callHint(env.toolCallStyle ?? 'native', 'decompress', '{ blockId }')}`,
   }
 }
 

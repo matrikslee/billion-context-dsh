@@ -56,7 +56,14 @@ import {
   stripOrphanedSurfaceToolMessages,
   type KernelRangeView,
 } from './region.ts'
-import { allLogMessages, eventsToCoreMessages, overflowMarkerSummary, surfaceEventsOf, toolCallIdOfResultEvent } from './messages.ts'
+import { allLogMessages, eventsToCoreMessages, extractEventText, overflowMarkerSummary, surfaceEventsOf, toolCallIdOfResultEvent } from './messages.ts'
+import {
+  detectPtcMode,
+  looksLikeLeakedAcpCall,
+  toPtcPrompts,
+  type ResolvedCallStyle,
+  type ToolCallStyle,
+} from './ptc.ts'
 import { shadowedTokensViaMeter } from './host-tokens.ts'
 import { kernelConfigFor } from './config.ts'
 import {
@@ -242,6 +249,14 @@ export interface AcpConfig {
   readonly settingsEnabled?: boolean
   /** Per-stage prompt template overrides (nudge / range table / system prompt / tool descriptions). See docs/configurable-prompts-design.md. */
   readonly prompts?: AcpPrompts
+  /**
+   * How the model reaches the ACP tools. `auto` (default) detects PTC / code mode
+   * from the assembled system prompt of each session every step; `native` or
+   * `ptc` pin it (an operator override, or a host whose PTC copy changes).
+   * Composition-layer only — deliberately NOT a settings knob, so the six-key
+   * settings surface (AcpPluginConfigSchema) is untouched. See src/ptc.ts.
+   */
+  readonly toolCallStyle?: ToolCallStyle
 }
 
 const DEFAULT_CONFIG: AcpConfig = {
@@ -393,6 +408,22 @@ export class AcpCompactionEngine extends CompactionEngine {
   readonly config: AcpConfig
   /** Resolved prompt templates (validated at construction — fail-fast on template typos). */
   readonly prompts: ResolvedPrompts
+  /** The prompt set ACTUALLY applied to the current step: `prompts` in native
+   *  mode, its PTC variant in code mode (src/ptc.ts). `prompts` keeps the
+   *  composition value so introspection and tests see what was configured. */
+  private currentPrompts: ResolvedPrompts
+  /** The calling convention the currently registered surface was built for. */
+  private appliedStyle: ResolvedCallStyle
+  /** Disposers of the tool registrations this instance made — `tools.register()`
+   *  returns the exact disposer, which is what lets a mode flip REPLACE the
+   *  descriptions instead of stacking a second layer per flip. */
+  private toolDisposers: Array<() => void> = []
+  /** Same, for the ACP system-prompt section (`systemPrompt.section()`). */
+  private systemPromptDisposer: (() => void) | undefined
+  /** Per session: the newest leaked direct call already corrected, plus how many
+   *  corrections were spent (the leak is silent on the host, so the nudge is the
+   *  only channel — bounded to avoid a per-step nag). */
+  private readonly ptcLeakNotes = new Map<string, { seq: number; count: number }>()
   /**
    * The environment wired into tools / command / nudge. Exposed so tests (and
    * introspection) can assert the forwarding actually happened: the config
@@ -433,6 +464,13 @@ export class AcpCompactionEngine extends CompactionEngine {
     // Resolve + validate prompt templates BEFORE building env: a template typo
     // must fail engine construction, never silently leak into model context.
     this.prompts = resolvePrompts(config.prompts)
+    // Calling convention at mount: a pinned `toolCallStyle: ptc` applies right
+    // away; `auto` (the default) starts native and detects per session at the
+    // first pre-step — the ASSEMBLED system prompt is the only place the mode is
+    // observable, because it arrives through an agent preset this engine cannot
+    // read (src/ptc.ts, measured on host 0.2.2-alpha.2).
+    this.appliedStyle = this.config.toolCallStyle === 'ptc' ? 'ptc' : 'native'
+    this.currentPrompts = this.appliedStyle === 'ptc' ? toPtcPrompts(this.prompts) : this.prompts
     const ports = this.config.countTokens !== undefined ? { countTokens: this.config.countTokens } : {}
     this.kernel = createCore(ports)
     // The kernel's docFeatures cache (per-doc search features) defaults to an
@@ -623,7 +661,12 @@ export class AcpCompactionEngine extends CompactionEngine {
       // kernel actually reads — this field never feeds kernelConfigFor.
       preset: this.config.preset,
       windowFor: (agent) => this.windowFor(agent),
-      prompts: this.prompts,
+      // Prompt set and calling convention read LIVE so a mode flip applies to
+      // the next call without rebuilding env (the two are swapped together in
+      // `applyToolCallStyle`, never independently — a PTC nudge with native
+      // descriptions would send the model back to the failing shape).
+      get prompts() { return engine.currentPrompts },
+      get toolCallStyle() { return engine.appliedStyle },
       compressCallIdsToHide: this.compressCallIdsToHide,
       settingsCommand: this.settingsCommand,
     }
@@ -639,18 +682,13 @@ export class AcpCompactionEngine extends CompactionEngine {
     // late callback never double-registers.
     const tools = ctx.get('tools')
     if (tools !== undefined) {
-      for (const tool of makeTools(env)) tools.register(tool)
+      this.registerToolSurface()
     } else {
       let done = false
-      const registerTools = (): void => {
-        if (done) return
-        const registry = ctx.get('tools')
-        if (registry === undefined) return
-        done = true
-        for (const tool of makeTools(env)) registry.register(tool)
-      }
       ctx.on('internal/service', (name: unknown) => {
-        if (name === 'tools') registerTools()
+        if (name !== 'tools' || done) return
+        done = true
+        this.registerToolSurface()
       })
     }
     const commands = ctx.get('commands')
@@ -721,6 +759,13 @@ export class AcpCompactionEngine extends CompactionEngine {
       // the forms line, writes committed between steps land in our volatile
       // refs with no event we receive — this re-read is what applies them.
       engine.resyncSettings()
+      // Calling-convention gate BEFORE anything that renders model-facing copy:
+      // a PTC session must register `await tools.*` descriptions and nudge text,
+      // never the direct-call shape the host rejects (src/ptc.ts). Cheap — a
+      // marker scan over the session's system rows — and the heal below builds
+      // its definitions from `env`, so it must see the applied style.
+      const style = engine.resolveToolCallStyle(payload.agent.session)
+      if (style !== engine.appliedStyle) engine.applyToolCallStyle(style)
       // Registration self-heal (src/registration.ts): `tools.register()` is a
       // layer effect on the REGISTRY instance, so when the host rebuilds an
       // agent realm the four ACP tools vanish while this plugin instance stays
@@ -742,7 +787,13 @@ export class AcpCompactionEngine extends CompactionEngine {
       const window = await this.windowFor(payload.agent)
       const outcome = buildNudge(
         payload.agent,
-        { ...env, modelContextLimit: window.limit },
+        {
+          ...env,
+          modelContextLimit: window.limit,
+          // Consumed here, not inside buildNudge: the note rides the nudge this
+          // step injects, and a step without a nudge must not silently spend it.
+          ptcLeakNote: engine.takePtcLeakNote(payload.agent.session),
+        },
         this.lastNudgeTurn,
         this.emergencyNudges,
         () => {
@@ -827,28 +878,117 @@ export class AcpCompactionEngine extends CompactionEngine {
     // late callback never double-registers.
     const systemPrompt = ctx.get('systemPrompt')
     if (systemPrompt !== undefined) {
-      systemPrompt.section({
-        name: 'billion-context-dsh',
-        order: ACP_SYSTEM_PROMPT_ORDER,
-        text: renderSystemPrompt(this.prompts),
-      })
+      this.registerPromptSurface()
     } else {
       let done = false
-      const registerSystemPrompt = (): void => {
-        if (done) return
-        const registry = ctx.get('systemPrompt')
-        if (registry === undefined) return
-        done = true
-        registry.section({
-          name: 'billion-context-dsh',
-          order: ACP_SYSTEM_PROMPT_ORDER,
-          text: renderSystemPrompt(this.prompts),
-        })
-      }
       ctx.on('internal/service', (name: unknown) => {
-        if (name === 'systemPrompt') registerSystemPrompt()
+        if (name !== 'systemPrompt' || done) return
+        done = true
+        this.registerPromptSurface()
       })
     }
+  }
+
+  /**
+   * Register (and remember the disposer of) the four ACP tools for the CURRENT
+   * prompt set. `tools.register()` returns the exact disposer, which
+   * {@link applyToolCallStyle} uses to replace the surface on a mode flip.
+   */
+  private registerToolSurface(): void {
+    const registry = this.ctx.get('tools')
+    if (registry === undefined) return
+    for (const tool of makeTools(this.env)) {
+      const dispose = registry.register(tool)
+      if (typeof dispose === 'function') this.toolDisposers.push(dispose as () => void)
+    }
+  }
+
+  /** Register (and remember the disposer of) the ACP system-prompt section. */
+  private registerPromptSurface(): void {
+    const registry = this.ctx.get('systemPrompt')
+    if (registry === undefined) return
+    const dispose = registry.section({
+      name: 'billion-context-dsh',
+      order: ACP_SYSTEM_PROMPT_ORDER,
+      text: renderSystemPrompt(this.currentPrompts),
+    })
+    if (typeof dispose === 'function') this.systemPromptDisposer = dispose as () => void
+  }
+
+  /**
+   * Swap the model-visible calling convention (src/ptc.ts). Runs from
+   * `agent/pre-step`, i.e. before the step builds its request, so the very next
+   * request carries the new descriptions and section text.
+   *
+   * Dispose-then-register: `register()` on a name that is already registered
+   * would stack a second layer contribution, so the old contributions go first.
+   * A failed re-registration is not fatal — the registration self-heal
+   * (`src/registration.ts`) restores whatever is missing on the next pre-step.
+   */
+  private applyToolCallStyle(style: ResolvedCallStyle): void {
+    if (style === this.appliedStyle) return
+    this.appliedStyle = style
+    this.currentPrompts = style === 'ptc' ? toPtcPrompts(this.prompts) : this.prompts
+    for (const dispose of this.toolDisposers) {
+      try {
+        dispose()
+      } catch {
+        // Registry already torn down by the host — nothing to release.
+      }
+    }
+    this.toolDisposers = []
+    if (this.systemPromptDisposer !== undefined) {
+      try {
+        this.systemPromptDisposer()
+      } catch {
+        // Same: a disposed realm cannot be un-registered from.
+      }
+      this.systemPromptDisposer = undefined
+    }
+    this.registerToolSurface()
+    this.registerPromptSurface()
+  }
+
+  /**
+   * Resolve the calling convention for this step: a pinned config always wins,
+   * otherwise the assembled system prompt of the session decides (`auto`).
+   */
+  private resolveToolCallStyle(session: Session): ResolvedCallStyle {
+    const configured = this.config.toolCallStyle
+    if (configured === 'native' || configured === 'ptc') return configured
+    return detectPtcMode(
+      surfaceEventsOf(session)
+        .filter((event) => event.type === 'system/message')
+        .map(extractEventText),
+    ) ? 'ptc' : 'native'
+  }
+
+  /** Per-session cap on direct-call corrections (a nag on every step would be
+   *  noise; three covers a model that keeps trying the direct shape). */
+  private static readonly PTC_LEAK_NOTE_MAX = 3
+
+  /**
+   * True when the model just emitted a direct ACP call as TEXT — in PTC mode the
+   * host rejects the name and the markup lands in the assistant text with no call
+   * and no error result, so nothing tells the model it failed. The next nudge
+   * carries the correction. Scans only the recent tail (a leak is a fresh event),
+   * and reports once per distinct leaked seq.
+   */
+  private takePtcLeakNote(session: Session): boolean {
+    if (this.appliedStyle !== 'ptc') return false
+    const events = surfaceEventsOf(session)
+    let leakSeq = 0
+    for (const event of events.slice(-40)) {
+      if (event.type !== 'assistant/message') continue
+      if (!looksLikeLeakedAcpCall(extractEventText(event))) continue
+      const seq = event.seq
+      if (typeof seq === 'number' && seq > leakSeq) leakSeq = seq
+    }
+    if (leakSeq === 0) return false
+    const record = this.ptcLeakNotes.get(session.id) ?? { seq: 0, count: 0 }
+    if (leakSeq <= record.seq || record.count >= AcpCompactionEngine.PTC_LEAK_NOTE_MAX) return false
+    this.ptcLeakNotes.set(session.id, { seq: leakSeq, count: record.count + 1 })
+    return true
   }
 
   /**
