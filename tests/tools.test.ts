@@ -196,6 +196,34 @@ test('M3: compress accepts multiple disjoint ranges in one call, each its own bl
   assert.ok(session.deriveMessages().length < before)
 })
 
+test('M3: compress swaps reversed boundaries instead of rejecting the call', async () => {
+  // Measured 2026-11-01 in one live window: 8 `reversed range` rejections —
+  // the model named the edges in the wrong order for a span it had genuinely
+  // consumed. A rejection costs a full retry turn; the swap is the same span.
+  const env = makeEnv()
+  const session = buildTextSession(12)
+  const compress = toolOf(env, 'compress')
+  const result = await compress.execute({
+    content: [
+      {
+        startSeq: 5,
+        endSeq: 1,
+        summary: 'Reversed boundaries on purpose: JWT token expiry plus the deployment pipeline notes, named end-first by the caller and folded into one segment.',
+      },
+    ],
+  } as never, fakeExec(session))
+
+  const text = (result as { text: string }).text
+  assert.match(text, /Compressed 1 block/)
+  assert.match(text, /seqs 1\.\.5/, 'the swapped span is what lands')
+  assert.match(text, /were reversed — swapped to 1\.\.5/, 'the swap is reported, never silent')
+  assert.doesNotMatch(text, /reversed range/)
+
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
+  assert.equal(ledger.length, 1)
+  assert.deepEqual(ledger[0]!.shadowedSeqs, [1, 2, 3, 4, 5])
+})
+
 test('M3: decompress recovers the shadowed originals read-only', async () => {
   const env = makeEnv()
   const session = buildTextSession(12)

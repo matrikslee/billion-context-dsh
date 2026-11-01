@@ -270,3 +270,19 @@ test('M4: /acp-prune compress stamps the summary with the LIVE route, not stale 
   assert.equal((summaryEvent.data as { provider?: string }).provider, 'live-provider', 'the summary carries the LIVE provider')
   assert.equal((summaryEvent.data as { model?: string }).model, 'live-model', 'the summary carries the LIVE model')
 })
+
+test('M4: /acp-prune compress swaps reversed args instead of failing the command', async () => {
+  // The human path gets the same treatment as the tool (src/commands.ts):
+  // `5 1` is the same span as `1 5`, and the swap is reported rather than
+  // silently applied.
+  const env = makeEnv(128000)
+  const session = buildSession(12)
+  const text = await runAcp(env, fakeAgent(session), 'compress 5 1 Authentication system: JWT access tokens with 15 minute expiry, refresh tokens in Redis with 30 day TTL.')
+  assert.match(text, /^Compressed seqs 1\.\.5/, 'the swapped span is what lands')
+  assert.match(text, /args 5\.\.1 were reversed — swapped/, 'the swap is reported')
+  const { rebuildBlockLedger } = await import('../src/region.ts')
+  const ledger = rebuildBlockLedger(session.snapshotEvents())
+  assert.equal(ledger.length, 1, 'one durable block')
+  assert.equal(ledger[0]!.start, 1, 'the block covers the swapped span')
+  assert.equal(ledger[0]!.end, 5)
+})

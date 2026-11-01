@@ -113,12 +113,18 @@ function compressText(env: ToolEnvironment, agent: Agent, args: string[]): strin
   if (args.length < 3) {
     return '/acp-prune compress <startSeq> <endSeq> <summary...>'
   }
-  const startSeq = Number(args[0])
-  const endSeq = Number(args[1])
+  const rawStart = Number(args[0])
+  const rawEnd = Number(args[1])
   const summary = args.slice(2).join(' ')
-  if (!Number.isInteger(startSeq) || !Number.isInteger(endSeq)) {
+  if (!Number.isInteger(rawStart) || !Number.isInteger(rawEnd)) {
     return '/acp-prune compress: startSeq and endSeq must be integers'
   }
+  // Reversed args are a slip, not a real span: swap them and say so (the
+  // compress tool does the same, src/tools.ts). `resolveSurfaceRange` keeps
+  // its `start ≤ end` invariant.
+  const swapped = rawStart > rawEnd
+  const startSeq = swapped ? rawEnd : rawStart
+  const endSeq = swapped ? rawStart : rawEnd
   const session = agent.session
   const { start, end } = resolveSurfaceRange(session, startSeq, endSeq)
   // A checkpoint summary node can only be distilled through the kernel (the
@@ -176,7 +182,7 @@ function compressText(env: ToolEnvironment, agent: Agent, args: string[]): strin
     provider,
     model,
   })
-  return `Compressed seqs ${start}..${end} (${shadowed.length} messages) as block ${compactionId.slice(0, 8)}`
+  return `Compressed seqs ${start}..${end} (${shadowed.length} messages) as block ${compactionId.slice(0, 8)}${swapped ? ` (args ${rawStart}..${rawEnd} were reversed — swapped)` : ''}`
 }
 
 const DECOMPRESS_USAGE = '/acp-prune decompress <blockId> [offset] [limit]'

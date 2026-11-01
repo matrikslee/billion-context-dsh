@@ -43,6 +43,7 @@ import { DEFAULT_SESSION_CACHE_LIMIT, LruMap } from './lru.ts'
 import { AcpStateStore } from './state.ts'
 import { makeTools, type ToolEnvironment } from './tools.ts'
 import { acpCommand } from './commands.ts'
+import { healRegistrations } from './registration.ts'
 import { buildNudge, EMERGENCY_NUDGE_MAX_PER_TURN, meterMediaPriceResolver, resolveTokenCount } from './nudge.ts'
 import { ACP_SYSTEM_PROMPT_ORDER } from './system-prompt.ts'
 import { renderSystemPrompt, resolvePrompts, type AcpPrompts, type ResolvedPrompts } from './prompts.ts'
@@ -720,6 +721,21 @@ export class AcpCompactionEngine extends CompactionEngine {
       // the forms line, writes committed between steps land in our volatile
       // refs with no event we receive — this re-read is what applies them.
       engine.resyncSettings()
+      // Registration self-heal (src/registration.ts): `tools.register()` is a
+      // layer effect on the REGISTRY instance, so when the host rebuilds an
+      // agent realm the four ACP tools vanish while this plugin instance stays
+      // mounted — and the activation `done` guard forbids a second attempt.
+      // Live signature (2026-11-01): every model call answered `unknown tool`
+      // for the first two steps of a resumed session. Checking here (before
+      // `next()` builds the request) restores them within the SAME step, and
+      // runs regardless of `autoNudge` because a nudging-off session still
+      // needs the tools.
+      const healed = healRegistrations(env, ctx.get('tools'), ctx.get('commands'), payload.agent)
+      if (healed.tools.length > 0 || healed.command) {
+        ctx.logger.warn(
+          `billion-context-dsh: re-registered ${healed.tools.join(', ')}${healed.command ? ' + /acp-prune' : ''} on session ${payload.agent.session.id} — the host registry was rebuilt since activation`,
+        )
+      }
       if (!engine.readSettingsSource().autoNudge) return next()
       const decision = await next()
       if (decision.kind === 'reject') return decision

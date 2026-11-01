@@ -631,10 +631,26 @@ async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: To
   // one durable transaction can ever land for it (issue #201).
   const seenRangeKeys = new Set<string>()
   const duplicateRangeNotes: string[] = []
+  // Reversed edges (`start > end`) are a model slip, not a real span — the same
+  // span with the boundaries swapped is what the caller meant (measured
+  // 2026-11-01 in one live window: 8 `reversed range` rejections, every one
+  // recoverable by a swap). Swapping HERE rather than inside
+  // `resolveSurfaceRange` keeps that resolver's `start ≤ end` invariant intact
+  // (its stale recovery and index arithmetic both assume ordered edges) and
+  // lets the advisory line name the ORIGINAL edges.
+  const swappedNotes: string[] = []
   const guardedSeqs = guardedSurfaceSeqsOf(session)
   for (const range of args.content!) {
-    const startSeq = parseBoundary(range.startSeq, byRef, session)
-    const endSeq = parseBoundary(range.endSeq, byRef, session)
+    let startSeq = parseBoundary(range.startSeq, byRef, session)
+    let endSeq = parseBoundary(range.endSeq, byRef, session)
+    if (startSeq > endSeq) {
+      swappedNotes.push(
+        `  seqs ${startSeq}..${endSeq} were reversed — swapped to ${endSeq}..${startSeq}`,
+      )
+      const mirrored = startSeq
+      startSeq = endSeq
+      endSeq = mirrored
+    }
     let resolved: ResolvedSurfaceRange
     try {
       // Balance edges FIRST: the requested edges may sit mid-pair or on nodes
@@ -734,7 +750,7 @@ async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: To
   // Nothing to do: every requested range was already compressed, rejected, or
   // a duplicate of an earlier range in the same call.
   if (ranges.length === 0) {
-    const text = ['Compressed 0 block(s), ~0 tokens reclaimed.', ...alreadyCompressedNotes, ...duplicateRangeNotes, ...rejectedNotes]
+    const text = ['Compressed 0 block(s), ~0 tokens reclaimed.', ...swappedNotes, ...alreadyCompressedNotes, ...duplicateRangeNotes, ...rejectedNotes]
     if (alreadyCompressedNotes.length > 0) {
       text.push('  (all requested ranges were already compressed — decompress a block to recover its originals)')
     } else if (duplicateRangeNotes.length > 0 && rejectedNotes.length === 0) {
@@ -885,6 +901,7 @@ async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: To
     ...alreadyCompressedNotes,
     ...duplicateRangeNotes,
     ...rejectedNotes,
+    ...swappedNotes,
     ...lines,
   ]
   const footer = totalSkipped > 0
