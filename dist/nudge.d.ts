@@ -12,6 +12,7 @@ import { AcpStateStore } from './state.ts';
 import { type KernelRangeView, type MediaPriceOf } from './region.ts';
 import { type KernelConfigInput } from './config.ts';
 import { type ResolvedPrompts } from './prompts.ts';
+import { type ResolvedCallStyle } from './ptc.ts';
 export declare function stripNudgeGuidance(text: string): string;
 /** Kernel inputs the nudge path shares with the compress tool. */
 export interface NudgeEnvironment extends KernelConfigInput {
@@ -19,6 +20,12 @@ export interface NudgeEnvironment extends KernelConfigInput {
     readonly store: AcpStateStore;
     /** Resolved prompt templates (optional: falls back to DEFAULT_RESOLVED). */
     readonly prompts?: ResolvedPrompts;
+    /** How the model can REACH these tools this step (src/ptc.ts); default `native`.
+     *  `prompts` must already be the matching variant — the engine swaps both
+     *  together in `applyToolCallStyle`. */
+    readonly toolCallStyle?: ResolvedCallStyle;
+    /** Append the one-shot direct-call correction (a leaked XML call was seen). */
+    readonly ptcLeakNote?: boolean;
 }
 export interface NudgeOutcome {
     readonly message: UserMessage;
@@ -120,4 +127,4 @@ export declare function buildNudge(agent: Agent, env: NudgeEnvironment, lastNudg
  * When a host overrides any `prompts.nudge` slot, the template path is used so
  * `config.prompts` keeps full control (custom copy wins over kernel defaults).
  */
-export declare function buildNudgeText(nudge: NudgeDecision, emergency: boolean, session: import('@deepseek-ai/dsh-session').Session, kernelView: KernelRangeView, prompts?: ResolvedPrompts, mediaPriceOf?: MediaPriceOf): string;
+export declare function buildNudgeText(nudge: NudgeDecision, emergency: boolean, session: import('@deepseek-ai/dsh-session').Session, kernelView: KernelRangeView, prompts?: ResolvedPrompts, mediaPriceOf?: MediaPriceOf, style?: ResolvedCallStyle, leakNote?: boolean): string;

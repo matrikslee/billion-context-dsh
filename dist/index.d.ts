@@ -33,6 +33,7 @@ import { AcpStateStore } from './state.ts';
 import { type ToolEnvironment } from './tools.ts';
 import { type AcpPrompts, type ResolvedPrompts } from './prompts.ts';
 import { type AcpWindow } from './window.ts';
+import { type ToolCallStyle } from './ptc.ts';
 import { type SettingsCommandSurface } from './settings.ts';
 import { type PresetName } from './presets.ts';
 export { AcpStateStore } from './state.ts';
@@ -133,6 +134,14 @@ export interface AcpConfig {
     readonly settingsEnabled?: boolean;
     /** Per-stage prompt template overrides (nudge / range table / system prompt / tool descriptions). See docs/configurable-prompts-design.md. */
     readonly prompts?: AcpPrompts;
+    /**
+     * How the model reaches the ACP tools. `auto` (default) detects PTC / code mode
+     * from the assembled system prompt of each session every step; `native` or
+     * `ptc` pin it (an operator override, or a host whose PTC copy changes).
+     * Composition-layer only — deliberately NOT a settings knob, so the six-key
+     * settings surface (AcpPluginConfigSchema) is untouched. See src/ptc.ts.
+     */
+    readonly toolCallStyle?: ToolCallStyle;
 }
 export declare function resolveAcpConfig(config?: Partial<AcpConfig>): AcpConfig;
 /**
@@ -174,6 +183,22 @@ export declare class AcpCompactionEngine extends CompactionEngine {
     readonly config: AcpConfig;
     /** Resolved prompt templates (validated at construction — fail-fast on template typos). */
     readonly prompts: ResolvedPrompts;
+    /** The prompt set ACTUALLY applied to the current step: `prompts` in native
+     *  mode, its PTC variant in code mode (src/ptc.ts). `prompts` keeps the
+     *  composition value so introspection and tests see what was configured. */
+    private currentPrompts;
+    /** The calling convention the currently registered surface was built for. */
+    private appliedStyle;
+    /** Disposers of the tool registrations this instance made — `tools.register()`
+     *  returns the exact disposer, which is what lets a mode flip REPLACE the
+     *  descriptions instead of stacking a second layer per flip. */
+    private toolDisposers;
+    /** Same, for the ACP system-prompt section (`systemPrompt.section()`). */
+    private systemPromptDisposer;
+    /** Per session: the newest leaked direct call already corrected, plus how many
+     *  corrections were spent (the leak is silent on the host, so the nudge is the
+     *  only channel — bounded to avoid a per-step nag). */
+    private readonly ptcLeakNotes;
     /**
      * The environment wired into tools / command / nudge. Exposed so tests (and
      * introspection) can assert the forwarding actually happened: the config
@@ -204,6 +229,41 @@ export declare class AcpCompactionEngine extends CompactionEngine {
     /** Per-session overflow agents, so session progress can reset the recovery budget. */
     private readonly overflowSessions;
     constructor(ctx: Context, config?: Partial<AcpConfig>);
+    /**
+     * Register (and remember the disposer of) the four ACP tools for the CURRENT
+     * prompt set. `tools.register()` returns the exact disposer, which
+     * {@link applyToolCallStyle} uses to replace the surface on a mode flip.
+     */
+    private registerToolSurface;
+    /** Register (and remember the disposer of) the ACP system-prompt section. */
+    private registerPromptSurface;
+    /**
+     * Swap the model-visible calling convention (src/ptc.ts). Runs from
+     * `agent/pre-step`, i.e. before the step builds its request, so the very next
+     * request carries the new descriptions and section text.
+     *
+     * Dispose-then-register: `register()` on a name that is already registered
+     * would stack a second layer contribution, so the old contributions go first.
+     * A failed re-registration is not fatal — the registration self-heal
+     * (`src/registration.ts`) restores whatever is missing on the next pre-step.
+     */
+    private applyToolCallStyle;
+    /**
+     * Resolve the calling convention for this step: a pinned config always wins,
+     * otherwise the assembled system prompt of the session decides (`auto`).
+     */
+    private resolveToolCallStyle;
+    /** Per-session cap on direct-call corrections (a nag on every step would be
+     *  noise; three covers a model that keeps trying the direct shape). */
+    private static readonly PTC_LEAK_NOTE_MAX;
+    /**
+     * True when the model just emitted a direct ACP call as TEXT — in PTC mode the
+     * host rejects the name and the markup lands in the assistant text with no call
+     * and no error result, so nothing tells the model it failed. The next nudge
+     * carries the correction. Scans only the recent tail (a leak is a fresh event),
+     * and reports once per distinct leaked seq.
+     */
+    private takePtcLeakNote;
     /**
      * Resolve the effective context window for an agent. An explicitly
      * configured `modelContextLimit` always wins (no probe). Otherwise the live

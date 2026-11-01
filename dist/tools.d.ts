@@ -17,6 +17,7 @@ import type { AcpStateStore } from './state.ts';
 import { type KernelConfigInput } from './config.ts';
 import { type AcpWindow } from './window.ts';
 import { type ResolvedPrompts } from './prompts.ts';
+import { type ResolvedCallStyle } from './ptc.ts';
 import type { SettingsCommandSurface } from './settings.ts';
 import type { PresetName } from './presets.ts';
 export interface ToolEnvironment extends KernelConfigInput {
@@ -28,6 +29,11 @@ export interface ToolEnvironment extends KernelConfigInput {
     readonly windowFor?: (agent: Agent) => Promise<AcpWindow>;
     /** Resolved prompt templates (optional: falls back to DEFAULT_RESOLVED). */
     readonly prompts?: ResolvedPrompts;
+    /** How the model can REACH these tools in the current step (src/ptc.ts). The
+     *  engine swaps in the PTC variant of `prompts` together with this, so the two
+     *  never disagree; a stand-in env (tests, plain compositions) defaults to
+     *  `native` and keeps the direct-call copy byte-identical. */
+    readonly toolCallStyle?: ResolvedCallStyle;
     /**
      * Call ids of compress invocations that created a durable block. The engine
      * listens for the matching `tool/result` and hides the call/result pair from

@@ -1,8 +1,8 @@
 # billion-context-dsh
 
-> **🛑 Unmaintained** — this project has been superseded by **[ranxianglei/billion-context](https://github.com/ranxianglei/billion-context)**, the unified upstream version with native DeepSeek Harness support. No further updates, bug fixes, or feature work. Published versions remain installable but unsupported.
+> **🔧 Maintained fork** — this is the DSH-specific adapter line, maintained under [matrikslee/billion-context-dsh](https://github.com/matrikslee/billion-context-dsh) and tracking the DSH host release line. The unified upstream [ranxianglei/billion-context](https://github.com/ranxianglei/billion-context) covers pi / OpenCode / Claude Code and other hosts; kernel bugs still go upstream.
 
-> **⚠️ Beta notice** — this project (v0.2.29) and the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) are both in **public beta**: do not use in engineering / production environments.
+> **⚠️ Beta notice** — this project (v0.2.30) and the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) are both in **public beta**: do not use in engineering / production environments.
 
 **Model-driven context management (Active Context Pruning / ACP) for the DeepSeek Harness.** The model decides *when* and *what* to compress — not a hard limit. Ported from [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) (by [ranxianglei](https://github.com/ranxianglei), MIT); the compression core [acp-kernel](https://github.com/ranxianglei/acp-kernel) is reused verbatim.
 

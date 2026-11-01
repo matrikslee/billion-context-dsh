@@ -1,6 +1,6 @@
 {
 	"name": "billion-context-dsh",
-	"version": "0.2.29",
+	"version": "0.2.30",
 	"description": "Self-maintained fork of Tyan66666/billion-context-dsh; Active Context Pruning (ACP) for the DeepSeek Harness — model-driven context management as a CompactionEngine backend.",
 	"keywords": [
 		"deepseek",
@@ -64,7 +64,7 @@
 		"@deepseek-ai/dsh-typert-protocol": ">=0.2.2-alpha.1 <0.3.0-0",
 		"@deepseek-ai/dsh-util-crypto": ">=0.2.2-alpha.1 <0.3.0-0",
 		"@deepseek-ai/dsh-util-values": ">=0.2.2-alpha.1 <0.3.0-0",
-		"@deepseek-ai/schemastery": "^3.18.2"
+		"@deepseek-ai/schemastery": ">=3.18.2-alpha.1 <4.0.0-0"
 	},
 	"devDependencies": {
 		"acp-kernel": "0.0.101",

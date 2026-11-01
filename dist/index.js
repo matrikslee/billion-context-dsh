@@ -7933,6 +7933,63 @@ When you write a summary, it becomes the ONLY record of that range: keep file pa
 };
 var DEFAULT_RESOLVED = DEFAULT_PROMPTS;
 
+// src/ptc.ts
+var PTC_MARKERS = [
+  "is the only tool you can call directly",
+  "## Writing code for run_code"
+];
+var TOOL_CALL_MARK = `<tool_call>`;
+function detectPtcMode(texts) {
+  for (const text of texts) {
+    if (typeof text !== "string") continue;
+    for (const marker of PTC_MARKERS) {
+      if (text.includes(marker)) return true;
+    }
+  }
+  return false;
+}
+var PTC_SYSTEM_LINE = "Calling convention in this session (PTC / code mode): `run_code` is the only directly callable tool \u2014 reach the ACP tools from inside a `run_code` program (`await tools.compress({ content: [...] })`, `await tools.acp_status({})`, `await tools.decompress({ blockId })`, `await tools.search_context({ query })`). A direct call naming them produces no call and no error \u2014 it silently emits text. Build summary strings from single-quoted lines joined by a newline; template literals break on the backticks summaries contain.";
+var PTC_FOOTER_NOTICE = "PTC mode: call it inside `run_code` \u2014 `await tools.compress({ content: [...] })`; a direct call fails silently.";
+var PTC_TOOL_CLAUSE = "PTC mode: call it as `await tools.compress({ content: [...] })` from a `run_code` program \u2014 a direct call fails silently. Build `summary` from single-quoted strings joined by a newline (summaries contain backticks).";
+function toPtcCallSyntax(text) {
+  return text.replace(/\bsearch_context\(query\)/g, "await tools.search_context({ query })").replace(/(?<!tools\.)\bcompress\(\{/g, "await tools.compress({").replace(/(?<!tools\.)\bdecompress\(\{/g, "await tools.decompress({").replace(/(?<!tools\.)\bsearch_context\(\{/g, "await tools.search_context({").replace(/(?<!tools\.)\bacp_status\(\{/g, "await tools.acp_status({");
+}
+function ptcText(text, style) {
+  return style === "ptc" ? toPtcCallSyntax(text) : text;
+}
+function toPtcPrompts(prompts) {
+  const rewriteGroup = (group) => {
+    const out = {};
+    for (const [key, value] of Object.entries(group)) {
+      out[key] = toPtcCallSyntax(value);
+    }
+    return out;
+  };
+  return {
+    nudge: prompts.nudge,
+    rangeTable: {
+      ...rewriteGroup(prompts.rangeTable),
+      footer: `${PTC_FOOTER_NOTICE}
+${toPtcCallSyntax(prompts.rangeTable.footer)}`
+    },
+    tools: {
+      ...rewriteGroup(prompts.tools),
+      compress: `${PTC_TOOL_CLAUSE}
+${toPtcCallSyntax(prompts.tools.compress)}`
+    },
+    systemPromptTemplate: `${PTC_SYSTEM_LINE}
+
+${toPtcCallSyntax(prompts.systemPromptTemplate)}`
+  };
+}
+function callHint(style, name, shape) {
+  return style === "ptc" ? `await tools.${name}(${shape})` : `${name}(${shape})`;
+}
+var PTC_LEAK_CORRECTION = "Correction: an earlier turn emitted a direct `compress` call as plain text \u2014 on that path nothing executes and nothing errors. Emit no XML markup; reach the ACP tools inside `run_code` (`await tools.compress({ content: [...] })`).";
+function looksLikeLeakedAcpCall(text) {
+  return text.includes(TOOL_CALL_MARK) && /\b(compress|decompress|search_context|acp_status)\b/.test(text);
+}
+
 // src/nudge.ts
 var GUIDANCE_BLOCKS = [COMPRESS_PHILOSOPHY, HOW_TO_COMPRESS_RULES, TIER2_DISTILL_RULES, TIER3_CONDENSE_RULES];
 function stripNudgeGuidance(text) {
@@ -8054,13 +8111,18 @@ function buildNudge(agent, env, lastNudgeTurn, emergencyNudges, onEmergencyCapHi
       emergencyNudges.set(session.id, { turn: turnNumber, count: 1 });
     }
   }
+  const style = env.toolCallStyle ?? "native";
   const text = buildNudgeText(
     nudge,
     emergency,
     session,
     kernelRangeViewOf(nudge, turn.state),
     env.prompts,
-    mediaPriceOf
+    mediaPriceOf,
+    style,
+    // The correction rides the nudge the engine is already injecting — no extra
+    // message, no extra injection surface (the leak is otherwise silent).
+    style === "ptc" && env.ptcLeakNote === true
   );
   const message = createUserMessage2({
     content: [{ type: "text", text }],
@@ -8074,30 +8136,31 @@ function buildNudge(agent, env, lastNudgeTurn, emergencyNudges, onEmergencyCapHi
   });
   return { message, emergency };
 }
-function buildNudgeText(nudge, emergency, session, kernelView, prompts = DEFAULT_RESOLVED, mediaPriceOf) {
-  if (prompts.nudge !== DEFAULT_RESOLVED.nudge) {
-    return renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf);
-  }
-  const rendered = renderNudgeText(nudge);
-  return adaptKernelNudgeToSeq(rendered.text, nudge, session, kernelView, prompts, mediaPriceOf);
+function buildNudgeText(nudge, emergency, session, kernelView, prompts = DEFAULT_RESOLVED, mediaPriceOf, style = "native", leakNote = false) {
+  const text = prompts.nudge !== DEFAULT_RESOLVED.nudge ? renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf, style) : adaptKernelNudgeToSeq(renderNudgeText(nudge).text, nudge, session, kernelView, prompts, mediaPriceOf, style);
+  return leakNote && style === "ptc" ? `${text}
+
+${PTC_LEAK_CORRECTION}` : text;
 }
-function adaptKernelNudgeToSeq(text, nudge, session, kernelView, prompts, mediaPriceOf) {
+function adaptKernelNudgeToSeq(text, nudge, session, kernelView, prompts, mediaPriceOf, style = "native") {
   let out = stripNudgeGuidance(text);
   if ((nudge.tier === 2 || nudge.tier === 3) && (nudge.tierTargetBlocks?.length ?? 0) > 0) {
     out = replaceTierTrigger(out, nudge, session, prompts);
   } else if (out.includes('"startId"')) {
-    out = replaceEmergencyExample(out);
+    out = replaceEmergencyExample(out, style);
   }
   const seqTable = rangeTable(session, kernelView, prompts, mediaPriceOf);
   if (seqTable !== "") out = replaceRangesStr(out, seqTable);
-  out = insertContentFormNote(out);
-  return out;
+  out = insertContentFormNote(out, style);
+  return ptcText(out, style);
 }
-var CONTENT_FORM_NOTE = "Note: this tool takes the array form only \u2014 compress({ content: [{ startSeq, endSeq, summary }] }) with the surface seqs above; a plain-string content is rejected.";
-function insertContentFormNote(text) {
+function contentFormNote(style) {
+  return style === "ptc" ? "Note: this tool takes the array form only \u2014 call it from inside `run_code` as `await tools.compress({ content: [{ startSeq, endSeq, summary }] })` with the surface seqs above; a plain-string content is rejected and a direct `compress` call fails." : "Note: this tool takes the array form only \u2014 compress({ content: [{ startSeq, endSeq, summary }] }) with the surface seqs above; a plain-string content is rejected.";
+}
+function insertContentFormNote(text, style) {
   const tipAt = text.lastIndexOf("\n\n\u{1F4A1} ");
   if (tipAt === -1) return text;
-  return text.slice(0, tipAt) + "\n\n" + CONTENT_FORM_NOTE + text.slice(tipAt);
+  return text.slice(0, tipAt) + "\n\n" + contentFormNote(style) + text.slice(tipAt);
 }
 function replaceRangesStr(text, seqTable) {
   const match = text.match(/\n\n(?:Compressible ranges \(|\[No specific ranges detected)/);
@@ -8132,15 +8195,16 @@ function replaceTierTrigger(text, nudge, session, prompts) {
   });
   return text.slice(0, start) + "\n\n" + tierLine + text.slice(end);
 }
-function replaceEmergencyExample(text) {
+function replaceEmergencyExample(text, style = "native") {
   const start = text.search(/\n\n\{ "topic":/);
   if (start === -1) return text;
   const rest = text.slice(start + 2);
   const next = rest.match(/\n\nCompressible ranges |\n\n\[No specific/);
   const end = next !== null ? start + 2 + next.index : text.length;
-  return text.slice(0, start) + "\n\ncompress({ content: [{ startSeq, endSeq, summary }] }) \u2014 use the seqs from the range table above." + text.slice(end);
+  const example = style === "ptc" ? "\n\nawait tools.compress({ content: [{ startSeq, endSeq, summary }] }) from inside `run_code` \u2014 use the seqs from the range table above." : "\n\ncompress({ content: [{ startSeq, endSeq, summary }] }) \u2014 use the seqs from the range table above.";
+  return text.slice(0, start) + example + text.slice(end);
 }
-function renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf) {
+function renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf, style = "native") {
   const pct2 = Math.round(Math.min(nudge.contextUsage, 1) * 100);
   const frame = renderTemplate(
     emergency ? prompts.nudge.emergency : prompts.nudge.normal,
@@ -8183,8 +8247,8 @@ function renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts
   } else {
     parts.push(rangeTable(session, kernelView, prompts, mediaPriceOf));
   }
-  if (prompts.nudge.tip !== "") parts.push("", CONTENT_FORM_NOTE, "", prompts.nudge.tip);
-  return stripNudgeGuidance(parts.join("\n"));
+  if (prompts.nudge.tip !== "") parts.push("", contentFormNote(style), "", prompts.nudge.tip);
+  return ptcText(stripNudgeGuidance(parts.join("\n")), style);
 }
 
 // src/window.ts
@@ -8517,7 +8581,7 @@ async function handleCompress(env, args, exec) {
   const unwrapped = unwrapCompressArgs(args);
   if (unwrapped === null) {
     return {
-      text: "compress: missing content \u2014 pass the content array directly: compress({ content: [{ startSeq, endSeq, summary }] })"
+      text: `compress: missing content \u2014 pass the content array directly: ${callHint(env.toolCallStyle ?? "native", "compress", "{ content: [{ startSeq, endSeq, summary }] }")}`
     };
   }
   args = unwrapped;
@@ -8823,7 +8887,7 @@ function buildSearchDocs(session) {
   searchDocsCache.set(events, docs);
   return docs;
 }
-function handleSearch(_env, rawArgs, exec) {
+function handleSearch(env, rawArgs, exec) {
   const args = unwrapEnvelope(rawArgs);
   const session = requireAgent(exec).session;
   if (args.query.trim() === "") return { text: "search_context: empty query (no matches)" };
@@ -8838,7 +8902,7 @@ function handleSearch(_env, rawArgs, exec) {
     text: `Matches for "${args.query}":
 ${lines.join("\n")}
 
-Decompress with: decompress({ blockId })`
+Decompress with: ${callHint(env.toolCallStyle ?? "native", "decompress", "{ blockId }")}`
   };
 }
 var statusParameters = {
@@ -9495,7 +9559,7 @@ function assertNudgeThresholdOrder(config) {
     throw new Error(`nudge thresholds are inverted (${describe}) \u2014 nudgeMinContextLimitPct must be <= nudgeEmergencyThresholdPct`);
   }
 }
-var AcpCompactionEngine = class extends CompactionEngine {
+var AcpCompactionEngine = class _AcpCompactionEngine extends CompactionEngine {
   /**
    * Static plugin config schema — cordis reads `plugin.Config` off the raw
    * plugin value at fiber start and validates the composition row against it
@@ -9515,6 +9579,22 @@ var AcpCompactionEngine = class extends CompactionEngine {
   config;
   /** Resolved prompt templates (validated at construction — fail-fast on template typos). */
   prompts;
+  /** The prompt set ACTUALLY applied to the current step: `prompts` in native
+   *  mode, its PTC variant in code mode (src/ptc.ts). `prompts` keeps the
+   *  composition value so introspection and tests see what was configured. */
+  currentPrompts;
+  /** The calling convention the currently registered surface was built for. */
+  appliedStyle;
+  /** Disposers of the tool registrations this instance made — `tools.register()`
+   *  returns the exact disposer, which is what lets a mode flip REPLACE the
+   *  descriptions instead of stacking a second layer per flip. */
+  toolDisposers = [];
+  /** Same, for the ACP system-prompt section (`systemPrompt.section()`). */
+  systemPromptDisposer;
+  /** Per session: the newest leaked direct call already corrected, plus how many
+   *  corrections were spent (the leak is silent on the host, so the nudge is the
+   *  only channel — bounded to avoid a per-step nag). */
+  ptcLeakNotes = /* @__PURE__ */ new Map();
   /**
    * The environment wired into tools / command / nudge. Exposed so tests (and
    * introspection) can assert the forwarding actually happened: the config
@@ -9549,6 +9629,8 @@ var AcpCompactionEngine = class extends CompactionEngine {
     super(ctx);
     this.config = resolveAcpConfig({ ...config, ...liveSettingsFromRefs(filterSettingsEntry(config)) });
     this.prompts = resolvePrompts2(config.prompts);
+    this.appliedStyle = this.config.toolCallStyle === "ptc" ? "ptc" : "native";
+    this.currentPrompts = this.appliedStyle === "ptc" ? toPtcPrompts(this.prompts) : this.prompts;
     const ports = this.config.countTokens !== void 0 ? { countTokens: this.config.countTokens } : {};
     this.kernel = createCore(ports);
     setDocCacheCap(128 * 1024 * 1024);
@@ -9643,25 +9725,29 @@ var AcpCompactionEngine = class extends CompactionEngine {
       // kernel actually reads — this field never feeds kernelConfigFor.
       preset: this.config.preset,
       windowFor: (agent) => this.windowFor(agent),
-      prompts: this.prompts,
+      // Prompt set and calling convention read LIVE so a mode flip applies to
+      // the next call without rebuilding env (the two are swapped together in
+      // `applyToolCallStyle`, never independently — a PTC nudge with native
+      // descriptions would send the model back to the failing shape).
+      get prompts() {
+        return engine.currentPrompts;
+      },
+      get toolCallStyle() {
+        return engine.appliedStyle;
+      },
       compressCallIdsToHide: this.compressCallIdsToHide,
       settingsCommand: this.settingsCommand
     };
     this.env = env;
     const tools = ctx.get("tools");
     if (tools !== void 0) {
-      for (const tool of makeTools(env)) tools.register(tool);
+      this.registerToolSurface();
     } else {
       let done = false;
-      const registerTools = () => {
-        if (done) return;
-        const registry3 = ctx.get("tools");
-        if (registry3 === void 0) return;
-        done = true;
-        for (const tool of makeTools(env)) registry3.register(tool);
-      };
       ctx.on("internal/service", (name) => {
-        if (name === "tools") registerTools();
+        if (name !== "tools" || done) return;
+        done = true;
+        this.registerToolSurface();
       });
     }
     const commands = ctx.get("commands");
@@ -9699,6 +9785,8 @@ var AcpCompactionEngine = class extends CompactionEngine {
     ctx.on("agent/pre-step", async (payload, next) => {
       stripOrphanedSurfaceToolMessages(payload.agent.session);
       engine.resyncSettings();
+      const style = engine.resolveToolCallStyle(payload.agent.session);
+      if (style !== engine.appliedStyle) engine.applyToolCallStyle(style);
       const healed = healRegistrations(env, ctx.get("tools"), ctx.get("commands"), payload.agent);
       if (healed.tools.length > 0 || healed.command) {
         ctx.logger.warn(
@@ -9711,7 +9799,13 @@ var AcpCompactionEngine = class extends CompactionEngine {
       const window = await this.windowFor(payload.agent);
       const outcome = buildNudge(
         payload.agent,
-        { ...env, modelContextLimit: window.limit },
+        {
+          ...env,
+          modelContextLimit: window.limit,
+          // Consumed here, not inside buildNudge: the note rides the nudge this
+          // step injects, and a step without a nudge must not silently spend it.
+          ptcLeakNote: engine.takePtcLeakNote(payload.agent.session)
+        },
         this.lastNudgeTurn,
         this.emergencyNudges,
         () => {
@@ -9768,28 +9862,107 @@ var AcpCompactionEngine = class extends CompactionEngine {
     });
     const systemPrompt = ctx.get("systemPrompt");
     if (systemPrompt !== void 0) {
-      systemPrompt.section({
-        name: "billion-context-dsh",
-        order: ACP_SYSTEM_PROMPT_ORDER,
-        text: renderSystemPrompt(this.prompts)
-      });
+      this.registerPromptSurface();
     } else {
       let done = false;
-      const registerSystemPrompt = () => {
-        if (done) return;
-        const registry3 = ctx.get("systemPrompt");
-        if (registry3 === void 0) return;
-        done = true;
-        registry3.section({
-          name: "billion-context-dsh",
-          order: ACP_SYSTEM_PROMPT_ORDER,
-          text: renderSystemPrompt(this.prompts)
-        });
-      };
       ctx.on("internal/service", (name) => {
-        if (name === "systemPrompt") registerSystemPrompt();
+        if (name !== "systemPrompt" || done) return;
+        done = true;
+        this.registerPromptSurface();
       });
     }
+  }
+  /**
+   * Register (and remember the disposer of) the four ACP tools for the CURRENT
+   * prompt set. `tools.register()` returns the exact disposer, which
+   * {@link applyToolCallStyle} uses to replace the surface on a mode flip.
+   */
+  registerToolSurface() {
+    const registry3 = this.ctx.get("tools");
+    if (registry3 === void 0) return;
+    for (const tool of makeTools(this.env)) {
+      const dispose = registry3.register(tool);
+      if (typeof dispose === "function") this.toolDisposers.push(dispose);
+    }
+  }
+  /** Register (and remember the disposer of) the ACP system-prompt section. */
+  registerPromptSurface() {
+    const registry3 = this.ctx.get("systemPrompt");
+    if (registry3 === void 0) return;
+    const dispose = registry3.section({
+      name: "billion-context-dsh",
+      order: ACP_SYSTEM_PROMPT_ORDER,
+      text: renderSystemPrompt(this.currentPrompts)
+    });
+    if (typeof dispose === "function") this.systemPromptDisposer = dispose;
+  }
+  /**
+   * Swap the model-visible calling convention (src/ptc.ts). Runs from
+   * `agent/pre-step`, i.e. before the step builds its request, so the very next
+   * request carries the new descriptions and section text.
+   *
+   * Dispose-then-register: `register()` on a name that is already registered
+   * would stack a second layer contribution, so the old contributions go first.
+   * A failed re-registration is not fatal — the registration self-heal
+   * (`src/registration.ts`) restores whatever is missing on the next pre-step.
+   */
+  applyToolCallStyle(style) {
+    if (style === this.appliedStyle) return;
+    this.appliedStyle = style;
+    this.currentPrompts = style === "ptc" ? toPtcPrompts(this.prompts) : this.prompts;
+    for (const dispose of this.toolDisposers) {
+      try {
+        dispose();
+      } catch {
+      }
+    }
+    this.toolDisposers = [];
+    if (this.systemPromptDisposer !== void 0) {
+      try {
+        this.systemPromptDisposer();
+      } catch {
+      }
+      this.systemPromptDisposer = void 0;
+    }
+    this.registerToolSurface();
+    this.registerPromptSurface();
+  }
+  /**
+   * Resolve the calling convention for this step: a pinned config always wins,
+   * otherwise the assembled system prompt of the session decides (`auto`).
+   */
+  resolveToolCallStyle(session) {
+    const configured = this.config.toolCallStyle;
+    if (configured === "native" || configured === "ptc") return configured;
+    return detectPtcMode(
+      surfaceEventsOf(session).filter((event) => event.type === "system/message").map(extractEventText)
+    ) ? "ptc" : "native";
+  }
+  /** Per-session cap on direct-call corrections (a nag on every step would be
+   *  noise; three covers a model that keeps trying the direct shape). */
+  static PTC_LEAK_NOTE_MAX = 3;
+  /**
+   * True when the model just emitted a direct ACP call as TEXT — in PTC mode the
+   * host rejects the name and the markup lands in the assistant text with no call
+   * and no error result, so nothing tells the model it failed. The next nudge
+   * carries the correction. Scans only the recent tail (a leak is a fresh event),
+   * and reports once per distinct leaked seq.
+   */
+  takePtcLeakNote(session) {
+    if (this.appliedStyle !== "ptc") return false;
+    const events = surfaceEventsOf(session);
+    let leakSeq = 0;
+    for (const event of events.slice(-40)) {
+      if (event.type !== "assistant/message") continue;
+      if (!looksLikeLeakedAcpCall(extractEventText(event))) continue;
+      const seq = event.seq;
+      if (typeof seq === "number" && seq > leakSeq) leakSeq = seq;
+    }
+    if (leakSeq === 0) return false;
+    const record = this.ptcLeakNotes.get(session.id) ?? { seq: 0, count: 0 };
+    if (leakSeq <= record.seq || record.count >= _AcpCompactionEngine.PTC_LEAK_NOTE_MAX) return false;
+    this.ptcLeakNotes.set(session.id, { seq: leakSeq, count: record.count + 1 });
+    return true;
   }
   /**
    * Resolve the effective context window for an agent. An explicitly
