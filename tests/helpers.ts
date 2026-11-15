@@ -24,6 +24,13 @@ export function appendUser(session: Session, text: string): void {
   }), { surfaceOp: 'append' })
 }
 
+/** A nudge row exactly as src/nudge.ts writes it (V4 producer kind). */
+export function appendNudge(session: Session, text: string): void {
+  session.append('user/message', createUserMessage({
+    content: [{ type: 'text', text }],
+    source: { kind: 'plugin:acp-nudge' },
+  }), { surfaceOp: 'append' })
+}
 export function appendAssistant(session: Session, text: string, turn = 1, step = 1): void {
   session.append('assistant/message', {
     turn,

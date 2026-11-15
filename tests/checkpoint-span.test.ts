@@ -58,6 +58,9 @@ function makeEnv(): ToolEnvironment {
     kernel: createCore({}) as CompressionCore,
     store: new AcpStateStore(),
     modelContextLimit: 128000,
+    // This file tests the checkpoint-carrier guard; the working-set floor would
+    // refuse its small fixtures for an unrelated reason (floor = window × 0.15).
+    foldFloorPct: 0,
     compressCallIdsToHide: new Set(),
   }
 }

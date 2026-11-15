@@ -256,8 +256,14 @@ export function isEngineWrittenSummary(text: string): boolean {
  * hidden to get the request under the window and where the originals still
  * live (the append-only log: search_context/decompress rebuild from it).
  */
-export function overflowMarkerSummary(hiddenCount: number): string {
-  return `${ENGINE_SUMMARY_LEAD}: ${hiddenCount} surface message(s) hidden because the provider rejected the request as exceeding the context window. The originals are intact in the session log — use search_context or decompress (see acp_status) to read them, or re-run the compress tool over this range to write a proper summary.]`
+/**
+ * Emergency marker summary. `provenance` is appended when present: a below-floor
+ * desperation fold MUST be distinguishable from a legitimate one when someone (or
+ * a later heuristic) reads this block — otherwise every floor statistic computed
+ * from durable folds is reading a lie (cross-review item 1).
+ */
+export function overflowMarkerSummary(hiddenCount: number, provenance?: string): string {
+  return `${ENGINE_SUMMARY_LEAD}: ${hiddenCount} surface message(s) hidden because the provider rejected the request as exceeding the context window. The originals are intact in the session log — use search_context or decompress (see acp_status) to read them, or re-run the compress tool over this range to write a proper summary.${provenance === undefined ? '' : ' EMERGENCY PROVENANCE: ' + provenance}]`
 }
 
 /**
@@ -446,6 +452,175 @@ export function attachmentsOfEvent(event: SessionEvent): { images: number; files
 }
 
 /**
+ * Spill files a tool result externalized. The host writes an oversized stdout /
+ * stderr to disk, keeps those bytes OUT of the surface, and names the file in the
+ * result (`spillPath`, `stdoutSpillPath`, `stderrSpillPath` — dsh-bash-local).
+ * A span carrying them is the SAFEST fold available: the content is still
+ * recoverable with a narrow read (grep -n -i -E, then a bounded window), so
+ * folding it loses nothing the model cannot fetch back. arXiv 2611.05306 RQ2 is
+ * exactly this move — externalize + selective read beat keeping bytes (median
+ * compaction count ~ 0, +30..40 pts on long-input tasks).
+ */
+const SPILL_KEY = /^(?:stdout|stderr)?[Ss]pillPaths?$/
+
+/**
+ * A spill directory this host actually writes into: `/tmp/dsh-spill-XXXX/…` (the formatted
+ * result) and `/tmp/dsh-subprocess-XXXX/…` (the raw stdout/stderr log).
+ *
+ * The host renders a spill as PROSE on its hottest tools, and there that is the ONLY form:
+ * `dsh-tool-bash/lib/index.js:144` and `dsh-tool-pwsh/lib/index.js:150` append
+ * `[output truncated; full output: <path>]`, and the harness omission notice (its wording comes
+ * from `dsh-spill-policy/lib/index.js:9` `LOCATION`) appends
+ * `(Omitted <N> bytes. Full formatted result stored at: <path>. Use read …)`. Measured
+ * 2026-11-15 on the live session: seq 3157 and seq 3220 (a 3 MB bash stdout each) carry BOTH
+ * sentences and no JSON key at all, so the key probe below marked zero rows — every row the
+ * prompt tells the model to fold first stayed unmarked (round-15 review Q1).
+ *
+ * Two gates keep a row that merely QUOTES the notice from being marked (grep over the host's own
+ * source, `cat` of a spill file): the prose scan runs only on `tool/result` events, and the path
+ * must sit inside one of these directories — the host source interpolates `${spillPath}` and
+ * never prints a concrete spill path, so a grep hit cannot match.
+ */
+const SPILL_PROSE_DIR = /^\/[^\s)\]"'`]*\/dsh-(?:spill|subprocess)-[^/\s\]"'`…]+\/[^\s\]"'`…]+$/
+
+function collectSpillProse(text: string, out: Set<string>): void {
+  // `]` is excluded too: a path followed by another bracketed marker with no space would
+  // otherwise be eaten by the greedy class (round-16 review Q3.2).
+  for (const match of text.matchAll(/\[output truncated; full output: (\/[^\s)\]"'`]+)\]/g)) {
+    if (SPILL_PROSE_DIR.test(match[1]!)) out.add(match[1]!)
+  }
+  // The stored-result sentence ends with its own advice (`. Use read with offset/limit, or grep
+  // this path …`), so the path is the first whitespace-delimited token and the sentence must be
+  // matched with a trailing `)` — a truncated `Omitted` fragment without the closing brace is not
+  // evidence the bytes reached a file.
+  // The notice continues past the path with a period and its own advice (`. Use read with
+  // offset/limit, or grep this path to search within it.)`), so the capture is greedy and the
+  // trailing period is trimmed: a lazy capture either drops the advice clause or returns a
+  // file name ending in ".".
+  for (const match of text.matchAll(/\(Omitted \d+ bytes\. Full formatted result stored at: (\/[^\s)]+)[^)]*\)/g)) {
+    const path = match[1]!.replace(/\.$/, '')
+    if (SPILL_PROSE_DIR.test(path)) out.add(path)
+  }
+}
+/**
+ * Snapshot-cached (rule 14 pattern): the scan walks tool output strings, and the
+ * range table is rebuilt on every nudge — an uncached scan turns every step into
+ * an O(surface) string walk. Events are immutable objects, so identity is a sound
+ * key (the append-only snapshot hands out the same frozen events until an append).
+ */
+const spillCache = new WeakMap<object, readonly string[]>()
+
+export function spillPathsOfEvent(event: SessionEvent): readonly string[] {
+  const key = event as unknown as object
+  const cached = spillCache.get(key)
+  if (cached !== undefined) return cached
+  const found = new Set<string>()
+  collectSpillPaths(contentBlocksOfEvent(event), found, 0, event.type === 'tool/result')
+  const paths = Object.freeze([...found])
+  spillCache.set(key, paths)
+  return paths
+}
+
+function collectSpillPaths(node: unknown, out: Set<string>, depth: number, fromToolResult = false): void {
+  if (node === null || node === undefined || depth > 6) return
+  if (typeof node === 'string') {
+    // Cheap gate first: a 3 MB tool result with no spill must not run two regex scans over the
+    // whole string. Every prose form this host writes contains `/dsh-` in its path, so the
+    // substring test cannot hide a real mark (round-16 review Q3.3).
+    if (fromToolResult && node.includes('/dsh-')) collectSpillProse(node, out)
+    // Tool outputs reach the log as JSON TEXT. The substring test ('pillPath'
+    // matches spillPath / stdoutSpillPath / stderrSpillPath) keeps this cheap:
+    // a normal tool output never parses, and only a candidate pays the parse.
+    if (!node.includes('pillPath')) return
+    // A serialized result object, not prose about the field. A tool result that
+    // merely DOCUMENTS spillPath (the agent grepping this plugin’s own source,
+    // reading a spill manifest, echoing a previous result) contains the same
+    // letters and must NOT count — the row would claim bytes are on disk that
+    // never were. The honest marker is the JSON KEY shape: a quoted key followed
+    // by a colon. A decorated wrapper ("[stderr]\n{…}", the pre-0.2.0 host
+    // shape) carries that key too, so a wrapper is accepted only when a document is
+    // actually delimited by braces inside the text (round-10 review S3).
+    const trimmed = node.trimStart()
+    // A DOCUMENT is a `{…}` object or a `[…]` ARRAY. A bare `startsWith('[')` also
+    // admitted the decorated pre-0.2.0 shape (`"[stderr]\n{…}"`) as a document, which
+    // skipped the delimited-brace and key-shape checks entirely — prose that merely
+    // quotes the key after a `[stderr]` header then got marked as a real spill
+    // (round-11 review Q3.2). An array document has its JSON right after the bracket;
+    // a decorated header has a word (`[stderr]`, `[stdout]`) and falls to the wrapper
+    // branch, where the braces and the key shape must both hold.
+    const isDocument = trimmed.startsWith('{') || /^\[\s*[{\[]/.test(trimmed)
+    const brace = isDocument ? 0 : trimmed.indexOf('{')
+    // A tool output that merely QUOTES the field must not count (round-10 review S3):
+    // grep over this plugin’s own source, a spill manifest listing, or an echoed earlier
+    // result all carry the key shape, and the row would then claim bytes are on FILE that
+    // were never spilled — the model folds real in-context content away on that promise.
+    // Accept a decorated wrapper (the pre-0.2.0 host shape, "[stderr]\n{…}") only when a
+    // JSON document is actually delimited inside the text. The KEY test is
+    // case-INSENSITIVE: stdoutSpillPath/stderrSpillPath carry an uppercase S, and a
+    // case-sensitive probe silently drops exactly the decorated host shape (round-11 Q3).
+    if (!isDocument) {
+      const close = trimmed.lastIndexOf('}')
+      if (brace < 0 || close <= brace) return
+      if (!/spillPaths?"\s*:/i.test(node)) return
+    }
+    const candidate = isDocument
+      ? trimmed
+      : trimmed.slice(brace, trimmed.lastIndexOf('}') + 1)
+    let parsed: unknown = null
+    try {
+      parsed = JSON.parse(candidate)
+    } catch {
+      parsed = null
+    }
+    if (parsed !== null) {
+      // Keep the tool-result flag: a JSON body whose VALUE carries the prose notice (the host
+      // escapes the newlines inside a string field) must still reach the prose scan after
+      // parsing (round-16 review Q3.1).
+      collectSpillPaths(parsed, out, depth + 1, fromToolResult)
+      return
+    }
+    // A host that truncated the JSON still names the file — but only a spilled file,
+    // which is always an absolute path on this host. Scan from the first brace to the END
+    // of the text, NOT to the last `}`: a field whose own value contains braces
+    // (`"stdout":"fn(){return 1}"`) made the delimited slice stop BEFORE "spillPath", so
+    // the parse failed AND the fallback searched a substring that no longer contained the
+    // key — a spill that really happened read as no spill (round-11 review Q3.2). The
+    // parse still gets the delimited slice, so prose that merely quotes the key cannot
+    // become a document here. A wrapper with NO closing brace is still refused above: an
+    // undelimited wrapper cannot prove the bytes went to a file, and a false mark makes
+    // the model fold real in-context bytes (S3) — a missed mark only costs one row
+    // marker, so the conservative side stays the safe side.
+    const scan = isDocument ? trimmed : trimmed.slice(brace)
+    for (const match of scan.matchAll(/"(?:stdout|stderr)?[Ss]pillPaths?"\s*:\s*"([^"\\]+)"/g)) {
+      const value = match[1]!
+      if (value.startsWith('/')) out.add(value)
+    }
+    // A truncated `{ "spillPaths": ["/tmp/…"] }` never parses and the scalar pattern cannot see
+    // inside the array, so the plural form needs its own scan (round-15 review Q2).
+    for (const match of scan.matchAll(/"(?:stdout|stderr)?[Ss]pillPaths"\s*:\s*\[([^\]]*)/g)) {
+      for (const item of match[1]!.matchAll(/"(\/[^"\\]*)"/g)) out.add(item[1]!)
+    }
+    return
+  }
+  if (Array.isArray(node)) {
+    for (const item of node) collectSpillPaths(item, out, depth + 1, fromToolResult)
+    return
+  }
+  if (typeof node !== 'object') return
+  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+    if (SPILL_KEY.test(key)) {
+      if (typeof value === 'string' && value !== '') out.add(value)
+      // `spillPaths` is an ARRAY of paths (dsh-jobs-local/lib/index.js:587-602). Recursing into it
+      // loses the parent key, and a bare string element is not evidence of a spill — the key is
+      // what proves the bytes went to a file (round-15 review Q2).
+      else if (Array.isArray(value)) {
+        for (const item of value) if (typeof item === 'string' && item.startsWith('/')) out.add(item)
+      } else collectSpillPaths(value, out, depth + 1, fromToolResult)
+    } else collectSpillPaths(value, out, depth + 1, fromToolResult)
+  }
+}
+
+/**
  * The image/file blocks themselves (not just their counts), in document order.
  * The compressible-range rows price these with the fixed-heuristic media price
  * when the meter reports no routed surcharge, so a media-bearing span is never
@@ -631,6 +806,22 @@ export function sourcePluginOf(
     return name.length > 0 ? name : undefined
   }
   return undefined
+}
+
+/**
+ * True for the nudge rows THIS engine injects, in every durable shape: the V4
+ * producer kind `plugin:acp-nudge` (what src/nudge.ts writes) and the legacy V3
+ * wrapper `{ kind: 'plugin', plugin: 'acp-nudge' }` older logs carry.
+ *
+ * The sweep that prunes superseded nudges (src/region.ts pruneStaleNudgeRows)
+ * shares this predicate with the classifier, so "what is our own echo" cannot
+ * disagree between the two paths.
+ */
+export function isAcpNudgeRow(event: SessionEvent): boolean {
+  if (event.type !== 'user/message') return false
+  const source = (event.data as { source?: { kind?: string; plugin?: string } }).source
+  if (!source) return false
+  return sourcePluginOf(source) === 'acp-nudge'
 }
 
 /**

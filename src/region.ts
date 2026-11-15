@@ -25,12 +25,14 @@ import {
   checkpointCompactionIdOf,
   extractEventText,
   attachmentsOfEvent,
+  spillPathsOfEvent,
   mediaBlocksOfEvent,
   extractText,
   isAgentInstructionsRow,
   isCheckpointNode,
   isRealUserTurn,
   isSkillCatalogRow,
+  isAcpNudgeRow,
   toolCallIdOfResultEvent,
   toolCallsOf,
   withSummaryFramePrefix,
@@ -748,6 +750,42 @@ export interface SeqCompressibleRange {
   readonly images: number
   /** File blocks reachable inside the span. */
   readonly files: number
+  /**
+   * Tokens that stay visible when this row is folded (`live surface − span`).
+   * With a fold floor configured, a row leaving LESS than that floor is
+   * `belowFloor`: folding it strands the model in the shallow-working-set regime
+   * where the paper's open-weight models collapsed (Appendix D).
+   */
+  readonly liveAfterFoldTokens: number
+  /** True when `floorTokens` is configured and this row would land under it. */
+  readonly belowFloor: boolean
+  /**
+   * Tool results inside the span whose overflow the host spilled to a FILE.
+   * The bytes are already out of the context and still readable from disk, so
+   * this span is recoverable after folding — the strongest fold-safety signal
+   * the surface has (see spillPathsOfEvent, src/messages.ts).
+   */
+  readonly spills: number
+  /**
+   * Tokens the NEXT request must re-prefill ONCE after this replace lands.
+   *
+   * Everything AFTER the rewrite point and NOTHING else — the fixed request head
+   * (system prompt, tool registry) sits BEFORE every rewrite point, so a warm
+   * cache reuses it and adding the paired overhead double-counted it (rule 3 B1).
+   * Measured 2026-11-15 on the live host with a
+   * real condense: prompt 125,665, reused 31,378 — the slot reuses the prompt
+   * prefix only up to where the replace landed, and 31,378 is NOT a multiple of
+   * the 2^14 KV block. (The earlier rule, written from 2026-11-14 data where
+   * reused happened to read 16384/32768 three times, claimed a constant reuse
+   * floor and priced 33,722 for a fold that actually re-prefilled 94,287 — a
+   * 2.8x under-quote.)
+   *
+   * So the rewrite point IS a lever: a fold EARLIER in the surface re-prefills
+   * more. Folding a span still removes those bytes from EVERY later request,
+   * which is the saving side. The note the model writes is extra and resident on
+   * every later request. See AGENTS.md rule 3.
+   */
+  readonly foldCostTokens: number
 }
 
 /**
@@ -757,6 +795,169 @@ export interface SeqCompressibleRange {
  * carry an image/file block.
  */
 export type MediaPriceOf = (seq: number) => number
+
+/**
+ * One KV block on THIS engine, measured 2026-11-14 as a recurring `reused` value.
+ * It is used ONLY as the working-set floor ceiling below. Measured 2026-11-15
+ * (reused 31,378 after a fold) post-fold reuse is the rewrite point's offset and
+ * is NOT block-aligned, so nothing subtracts this from a fold price any more.
+ */
+export const KV_BLOCK_TOKENS = 16384
+
+/**
+ * How much of the window must stay LIVE after a fold.
+ *
+ * arXiv 2611.05306 Appendix D, the open-weight band: at a 16K/12K regime the
+ * same tasks fell Qwen 3 Coder Next 53.0 → 3.6, Gemma 4 31B 65.2 → 58.0,
+ * Step 3.7 Flash 70.0 → 56.6, and EVERY model lost — the diagnosis is not the
+ * summary quality but "not enough room to make progress between compactions".
+ * This machine is exactly that class (open weights, verbose trajectories, one
+ * KV slot), so a fold that leaves a shallow working set is the failure mode the
+ * paper measured. The floor costs nothing per fold — it only forbids folding the
+ * widest rows — and buys the headroom the paper says open-weight models need.
+ * Fraction of the effective window; 0 disables.
+ */
+export const DEFAULT_FOLD_FLOOR_PCT = 0.15
+
+/**
+ * The floor is a GUARD, not an aspiration: it only bites when there was room
+ * to keep. A surface already smaller than the floor cannot satisfy it through any
+ * fold, so guarding there rejects every compress on a short session instead of
+ * protecting a working set (a `?? 0` slip turning every range into belowFloor is
+ * the footgun this predicate exists to close).
+ */
+export function belowWorkingSetFloor(totalTokens: number, liveAfterTokens: number, floor?: number): boolean {
+  return floor !== undefined && floor > 0 && totalTokens > floor && liveAfterTokens < floor
+}
+
+/**
+ * Price an EXPLICIT span with the same implementation the range table uses
+ * (`surfaceSuffixTokens` through the identical `nodePriceOf`), so the guard on a
+ * model-named range cannot disagree with the `below floor` mark on an offered row
+ * (rule 3: one price implementation). Returns belowFloor:false when no floor is
+ * configured — never a false reject on a `?? 0` slip.
+ */
+export function foldSpanPricing(
+  session: Session,
+  startSeq: number,
+  endSeq: number,
+  pricing?: FoldPricing,
+): { readonly spanTokens: number; readonly liveAfterTokens: number; readonly belowFloor: boolean } {
+  const nodes = session.surface.nodes
+  const suffix = surfaceSuffixTokens(session)
+  const total = suffix[0] ?? 0
+  const from = (nodes as readonly number[]).indexOf(startSeq)
+  const to = (nodes as readonly number[]).indexOf(endSeq)
+  if (from < 0 || to < from) return { spanTokens: 0, liveAfterTokens: total, belowFloor: false }
+  const spanTokens = Math.max(0, total - (suffix[to + 1] ?? 0) + (suffix[from]! - total))
+  const liveAfterTokens = Math.max(0, total - spanTokens)
+  const floor = pricing?.floorTokens
+  return {
+    spanTokens,
+    liveAfterTokens,
+    belowFloor: belowWorkingSetFloor(total, liveAfterTokens, floor),
+  }
+}
+
+/** Fold pricing inputs, threaded as ONE object so the render chain carries one slot. */
+export interface FoldPricing {
+  /**
+   * Fixed tokens the request carries OUTSIDE the counted surface — system prompt,
+   * tool registry, injected instruction copies. Measured 2026-11-15 on the live
+   * host: a fold's real re-prefill is every prompt token AFTER the rewrite point,
+   * and the fixed head sits BEFORE the rewrite point — inside the reused prefix —
+   * so it is NOT added to the fold price (round-10 review B1). It stays in the
+   * EMERGENCY fit check, which asks about the post-fold live size instead.
+   */
+  // requestOverheadTokens is deliberately NOT part of fold pricing: the fixed head
+  // is reused by every request, so charging it per fold double-counts it (B1).
+  /**
+   * Minimum tokens that must remain live after the fold (window × foldFloorPct).
+   * A row under it is flagged, and `condense` refuses it unless forced.
+   */
+  readonly floorTokens?: number
+}
+
+/**
+ * One node's price: the kernel's CJK-aware text count plus the media surcharge
+ * when the node really carries an attachment (issue #117). ONE implementation,
+ * shared by the segment walk and the rewrite-cost suffix below, so the two
+ * columns of a range row can never drift apart.
+ */
+function nodePriceOf(
+  event: NonNullable<ReturnType<typeof eventAtOf>>,
+  seq: number,
+  mediaPriceOf?: MediaPriceOf,
+): number {
+  const attachments = attachmentsOfEvent(event)
+  const mediaPrice = attachments.images + attachments.files > 0
+    ? (mediaPriceOf?.(seq) ?? 0) + hostMediaStructuralPrice(mediaBlocksOfEvent(event))
+    : 0
+  return defaultCountTokens(extractEventText(event)) + mediaPrice
+}
+
+/**
+ * Suffix prices of the current surface in surface order: suffix[i] is the price
+ * of nodes[i..] INCLUDING nodes[i], and suffix[nodes.length] is 0. The rewrite
+ * cost of a span whose resolved END sits at surface index i is suffix[i + 1].
+ *
+ * Cached on the surface node array (identity + length + last seq + the REPLACE
+ * GENERATION + the price callback itself), mirroring the snapshot-identity caching of
+ * rebuildBlockLedger (rule 14): an append yields a new or longer array and a
+ * replace rewrites it, so every mutation path invalidates, and the O(surface)
+ * walk is not repeated once per row of the same nudge.
+ *
+ * The generation is the load-bearing part of the key (round-11 review Q2): a
+ * `surfaceOp: replace` can keep the SAME array reference, the SAME length and the
+ * SAME last seq while rewriting an interior node — a 1-for-1 fold of one middle
+ * row, or `hideSurfaceSeqs` turning one interior row into one PRUNE_NOTE tombstone
+ * (rule 13 writes a VISIBLE user message, so the count survives). Length plus
+ * lastSeq reads a clean hit there and serves stale suffix numbers, which is the
+ * price the payback gate and the floor guard read. `surface.replaceGeneration`
+ * advances on every replace, so it catches every in-place rewrite whatever the
+ * host does to the array; the length/lastSeq checks stay because they are cheaper
+ * than a stale generation read is worth arguing about. The callback stays in the
+ * key (round-10 review S1): the nudge resolver and the emergency resolver can
+ * price the SAME unchanged surface, and a bare `priced` boolean served one
+ * callback’s media numbers to the other’s rows.
+ */
+const suffixCache = new WeakMap<
+  ReadonlyArray<number>,
+  {
+    len: number;
+    lastSeq: number;
+    generation: number;
+    mediaPriceOf?: MediaPriceOf
+    suffix: number[]
+  }
+>()
+
+// Exported for tests/suffix-cache.test.ts (same precedent as buildSearchDocs, rule 14):
+// the cache-key identity is the thing under test and it is not reachable through any
+// public call with two different resolvers on one unchanged surface.
+export function surfaceSuffixTokens(session: Session, mediaPriceOf?: MediaPriceOf): number[] {
+  const nodes = session.surface.nodes
+  const lastSeq = nodes.length > 0 ? nodes[nodes.length - 1]! : -1
+  const generation = session.surface.replaceGeneration
+  const cached = suffixCache.get(nodes)
+  if (
+    cached !== undefined &&
+    cached.len === nodes.length &&
+    cached.lastSeq === lastSeq &&
+    cached.generation === generation &&
+    cached.mediaPriceOf === mediaPriceOf
+  ) {
+    return cached.suffix
+  }
+  const suffix = new Array<number>(nodes.length + 1).fill(0)
+  for (let index = nodes.length - 1; index >= 0; index -= 1) {
+    const seq = nodes[index]!
+    const event = eventAtOf(session, seq)
+    suffix[index] = suffix[index + 1]! + (event === undefined ? 0 : nodePriceOf(event, seq, mediaPriceOf))
+  }
+  suffixCache.set(nodes, { len: nodes.length, lastSeq, generation, mediaPriceOf, suffix })
+  return suffix
+}
 
 /** Whether a surface message event is a tool message (tool-call or tool-result) — kernel `isToolMessage` parity. */
 function isToolEvent(event: SessionEvent): boolean {
@@ -926,6 +1127,8 @@ export function stripOrphanedSurfaceToolMessages(
   // whose result has not been decided yet.
   const open = new Map<string, { seq: number; index: number }>()
   const orphanResultSeqs: number[] = []
+  // Nudge rows caught between a call and its result (see the adjacency loop).
+  const nudgeInsidePairs: number[] = []
   // result seq -> call node seq, for pairs whose result landed but is not
   // adjacent to the call node on the surface.
   const brokenResults = new Map<number, number>()
@@ -958,7 +1161,23 @@ export function stripOrphanedSurfaceToolMessages(
         adjacent = true
         for (let mid = call.index + 1; mid < index; mid += 1) {
           const midEvent = eventAtOf(session, nodes[mid]!)
-          if (midEvent === undefined || midEvent.type !== 'tool/result') {
+          if (midEvent === undefined) {
+            adjacent = false
+            break
+          }
+          // A nudge row sitting between a call and its result is OUR garbage. The
+          // old behaviour deleted the pair (a real tool result the model may still
+          // need) to fix serialization; round-8 review named that as the single
+          // ship-blocking risk of the nudge sweep. Drop the nudge, keep the pair.
+          if (isAcpNudgeRow(midEvent)) {
+            nudgeInsidePairs.push(nodes[mid]!)
+            // No manual increment: the for-loop already advances. Advancing here SKIPPED
+            // the node after the nudge, so a foreign tool result between the pair was never
+            // checked and the pair was accepted as adjacent - exactly the unserialisable shape
+            // this stripper exists to remove (round-9 review, Gemini finding 1).
+            continue
+          }
+          if (midEvent.type !== 'tool/result') {
             adjacent = false
             break
           }
@@ -984,6 +1203,7 @@ export function stripOrphanedSurfaceToolMessages(
     }
   }
   const hiddenSet = new Set<number>(orphanResultSeqs)
+  for (const seq of nudgeInsidePairs) hiddenSet.add(seq)
   for (const resultSeq of brokenResults.keys()) hiddenSet.add(resultSeq)
   for (const [callSeq, ids] of callIdsBySeq) {
     const brokenIds = brokenIdsByCallSeq.get(callSeq)
@@ -1118,6 +1338,104 @@ export function newestSkillCatalogSeqOf(session: Session): number | null {
 }
 
 /**
+ * Instruction rows the host CANNOT bring back: every injected copy except the
+ * newest of its scope, plus every superseded skill-catalog row. Folding one while
+ * its newest copy stays visible is real reclamation, not loop fuel -
+ * guardedSurfaceSeqsOf pins exactly the newest copies for that reason. A row with
+ * no changes[] counts as stale too: with no scope the host presence gate cannot
+ * identify a file for it, so it can never be re-sent.
+ *
+ * EVIDENCE for the claim (rule 16, live-measured, not assumed): folding the
+ * NEWEST copy re-triggered an injection within 7 events in 20 of 43 compressions
+ * in a long session (session-8c15904e, seq 8 → re-injected at seq 53191); folding a
+ * superseded copy while the newest stayed visible produced no re-send. If a future
+ * host ever re-emits an older copy, this becomes a silent deletion of a live
+ * instruction with no error to notice — the fallback then is to offer no
+ * foldable instruction rows at all (return an empty set), not to keep folding.
+ *
+ * Only an explicit caller opts in (foldStaleInstructionRows, used by condense).
+ * The nudge range table never does: a stale copy stays a WALL there, so a span the
+ * model names can never reach across policy rows it might still need.
+ */
+export function staleInstructionRowsOf(session: Session): Set<number> {
+  const newest = newestInstructionSeqsOf(session)
+  const newestCatalog = newestSkillCatalogSeqOf(session)
+  const stale = new Set<number>()
+  for (const seq of session.surface.nodes) {
+    const event = eventAtOf(session, seq)
+    if (event === undefined || classifySurfaceEvent(event) !== 'instruction') continue
+    if (newest.has(seq)) continue
+    if (newestCatalog !== null && seq === newestCatalog) continue
+    stale.add(seq)
+  }
+  return stale
+}
+
+/** Text left in place of a pruned nudge row (same shape as `PRUNE_NOTE`). */
+export const STALE_NUDGE_NOTE = '(superseded pressure nudge — the newest nudge carries the live seqs)'
+
+/**
+ * Prune-ready nudge rows: the ones the model has ALREADY answered.
+ *
+ * A nudge is only redundant once a request carrying it got an answer — an
+ * `assistant/message` node later on the surface proves that. Everything with no
+ * answer after it is still unread: a normal nudge plus the emergency nudge the
+ * same step appends are BOTH live, and deleting the unread one drops the
+ * escalation signal mid-fold (round-8 review, all three models, Q4). So the rule
+ * is "answered before the last assistant turn", not "all but the newest".
+ *
+ * Rows inside the host recent-protection window stay: dsh-session refuses a
+ * replace on a protected node.
+ */
+/**
+ * A nudge shorter than this is not worth a prune: the tombstone plus its
+ * `compaction/prune` claim costs about what the row did. Measured on the fixture
+ * (a ~150-byte synthetic nudge) the sweep SAVED −39 bytes per row, while a real
+ * nudge median is 2,573 bytes (37 rows in one session log) against a ~90-byte
+ * tombstone — a genuine ~2.5 KB saving per row. The threshold keeps the sweep from
+ * paying write amplification on rows too small to matter.
+ */
+const MIN_NUDGE_PRUNE_CHARS = 400
+
+export function staleNudgeRowsOf(session: Session, preserve: number = 5): number[] {
+  const nodes = session.surface.nodes
+  let lastAnswer = -1
+  for (let index = nodes.length - 1; index >= 0; index -= 1) {
+    const event = eventAtOf(session, nodes[index]!)
+    if (event?.type === 'assistant/message') {
+      lastAnswer = index
+      break
+    }
+  }
+  if (lastAnswer < 0) return []
+  const protectedSeqs = protectedSurfaceSeqs(session, preserve)
+  const stale: number[] = []
+  for (let index = 0; index < lastAnswer; index += 1) {
+    const seq = nodes[index]!
+    const event = eventAtOf(session, seq)
+    if (event === undefined || !isAcpNudgeRow(event)) continue
+    if (protectedSeqs.has(seq)) continue
+    if (extractEventText(event).length < MIN_NUDGE_PRUNE_CHARS) continue
+    stale.push(seq)
+  }
+  return stale
+}
+export function pruneStaleNudgeRows(session: Session, preserve: number = 5): number {
+  let count = 0
+  for (const seq of staleNudgeRowsOf(session, preserve)) {
+    try {
+      hideSurfaceSeqs(session, [seq], STALE_NUDGE_NOTE)
+      count += 1
+    } catch {
+      continue
+    }
+  }
+  return count
+}
+/** Shared empty set so a plain range build allocates nothing per call. */
+const NO_FOLDABLE_INSTRUCTIONS: ReadonlySet<number> = new Set<number>()
+
+/**
  * Surface seqs NO caller may compress: the CURRENT (newest) injected
  * agent-instructions row of every scope (restricted to rows still visible on
  * the surface — one definition of "current" — `newestInstructionSeqsOf`) PLUS
@@ -1245,6 +1563,8 @@ interface CompressibleSegment {
   toolCount: number
   images: number
   files: number
+  /** Tool results whose overflow the host spilled to disk (re-readable). */
+  spills: number
 }
 
 /**
@@ -1264,6 +1584,7 @@ function compressibleSegmentsOf(
   toIndex: number,
   protectedSeqs: ReadonlySet<number>,
   mediaPriceOf?: MediaPriceOf,
+  foldableInstructionSeqs: ReadonlySet<number> = NO_FOLDABLE_INSTRUCTIONS,
 ): CompressibleSegment[] {
   const nodes = session.surface.nodes
   const segments: CompressibleSegment[] = []
@@ -1290,9 +1611,11 @@ function compressibleSegmentsOf(
       // events; observed again live in session-8c15904e, seq 8 absorbed by a
       // compress → host re-injected at seq 53191). Stale copies stay barriers
       // here too; the system-side GC that removes them lands separately
-      // (instruction hygiene PR2). Engine-authored metadata rows (nudge echo,
-      // compress-pair stub) intentionally fall through and stay foldable.
-      || classifySurfaceEvent(event) === 'instruction'
+      // (instruction hygiene PR2). A SUPERSEDED copy cannot come back, so a caller
+      // reclaiming a long session may opt in (foldStaleInstructionRows) and fold
+      // it; the CURRENT copy stays a wall on every path. Engine-authored metadata
+      // rows (nudge echo, compress-pair stub) fall through and stay foldable.
+      || (classifySurfaceEvent(event) === 'instruction' && !foldableInstructionSeqs.has(seq))
     ) {
       flush()
       continue
@@ -1306,10 +1629,8 @@ function compressibleSegmentsOf(
     // picture look free. The callback is only consulted for a seq that really
     // carries an attachment.
     const attachments = attachmentsOfEvent(event)
-    const mediaPrice = attachments.images + attachments.files > 0
-      ? (mediaPriceOf?.(seq) ?? 0) + hostMediaStructuralPrice(mediaBlocksOfEvent(event))
-      : 0
-    const tokens = defaultCountTokens(extractEventText(event)) + mediaPrice
+    const spills = spillPathsOfEvent(event).length
+    const tokens = nodePriceOf(event, seq, mediaPriceOf)
     const isTool = isToolEvent(event)
     if (current === null) {
       current = {
@@ -1320,6 +1641,7 @@ function compressibleSegmentsOf(
         toolCount: isTool ? 1 : 0,
         images: attachments.images,
         files: attachments.files,
+        spills,
       }
     } else {
       current.start = Math.min(current.start, seq)
@@ -1327,6 +1649,7 @@ function compressibleSegmentsOf(
       current.count += 1
       current.tokens += tokens
       current.toolCount += isTool ? 1 : 0
+      current.spills += spills
       current.images += attachments.images
       current.files += attachments.files
     }
@@ -1367,16 +1690,40 @@ function compressibleSegmentsOf(
 export function buildCompressibleSeqRanges(
   session: Session,
   kernelView: KernelRangeView,
-  opts: { preserveRecent?: number; mediaPriceOf?: MediaPriceOf } = {},
+  opts: { preserveRecent?: number; mediaPriceOf?: MediaPriceOf; foldStaleInstructionRows?: boolean; foldPricing?: FoldPricing } = {},
 ): SeqCompressibleRange[] {
   // Orphan tool messages corrupt the pairing balance cache and fragment every
   // large span. Prune them before mapping so the table reflects the surface
   // that will actually be compressed (issue #18).
-  stripOrphanedSurfaceToolMessages(session)
+  // In-flight calls of the current step must survive this strip: a `condense` runs
+  // INSIDE the step that called it, so its own assistant node (calls open, results
+  // not landed yet) is on the surface. Pruning it here deletes the ref the caller
+  // just read, and the range mapping then lands on a node that no longer exists —
+  // condense reported "nothing contiguous enough to fold" on every real session.
+  stripOrphanedSurfaceToolMessages(session, openToolCallIds(session))
   const nodes = session.surface.nodes
   const indexOfSeq = new Map<number, number>()
   for (let index = 0; index < nodes.length; index += 1) indexOfSeq.set(nodes[index]!, index)
   const protectedSeqs = protectedSurfaceSeqs(session, opts.preserveRecent ?? 5)
+  const foldableInstructionSeqs = opts.foldStaleInstructionRows === true
+    ? staleInstructionRowsOf(session)
+    : NO_FOLDABLE_INSTRUCTIONS
+  const priceMemo = new Map<number, number>()
+  // Rewrite-point prices, computed ONCE per table build (cache above): what a
+  // replace anchored at each row forces the next request to re-prefill.
+  // The meter callback is memoized per build: the suffix walk and the segment
+  // walk touch the same media seqs, and the routed measurement must stay one
+  // call per seq (tests/media-visibility.test.ts pins it).
+  const meter = opts.mediaPriceOf
+  const mediaPriceOf: MediaPriceOf | undefined =
+    meter === undefined ? undefined : (seq: number) => {
+      const seen = priceMemo.get(seq)
+      if (seen !== undefined) return seen
+      const value = meter(seq)
+      priceMemo.set(seq, value)
+      return value
+    }
+  const suffix = surfaceSuffixTokens(session, mediaPriceOf)
   const out: SeqCompressibleRange[] = []
   for (const range of kernelView.ranges) {
     const startSeq = seqOfKernelRef(kernelView.refs, range.startRef)
@@ -1391,11 +1738,13 @@ export function buildCompressibleSeqRanges(
       Math.min(from, to),
       Math.max(from, to),
       protectedSeqs,
-      opts.mediaPriceOf,
+      mediaPriceOf,
+      foldableInstructionSeqs,
     )
     for (const segment of segments) {
       try {
         const { start, end } = resolveSurfaceRange(session, segment.start, segment.end)
+        const endIndex = indexOfSeq.get(end) ?? segment.end
         out.push({
           start,
           end,
@@ -1404,6 +1753,25 @@ export function buildCompressibleSeqRanges(
           toolPct: segment.count > 0 ? Math.round((segment.toolCount / segment.count) * 100) : 0,
           images: segment.images,
           files: segment.files,
+          spills: segment.spills,
+          liveAfterFoldTokens: Math.max(0, (suffix[0] ?? 0) - segment.tokens),
+          belowFloor: belowWorkingSetFloor(
+            suffix[0] ?? 0,
+            Math.max(0, (suffix[0] ?? 0) - segment.tokens),
+            opts.foldPricing?.floorTokens,
+          ),
+          // Measured 2026-11-15 on the live host: a durable replace reuses the prompt
+          // prefix up to the rewrite point and re-prefills EVERYTHING AFTER IT
+          // (prompt 125,665 with reused 31,378, and 31,378 is NOT a multiple of the
+          // 2^14 KV block). The fixed request head — system prompt, tool registry,
+          // injected rows — sits BEFORE any rewrite point, so it lives inside that
+          // reused prefix and must NOT be added here. Measured the same day: two
+          // folds (rewrite points 17928 and 18137) billed 51,122 uncached tokens in
+          // total afterwards, while the range table quoted ~92K for a row on the same
+          // surface — the overhead term was the gap (round-10 review B1). The overhead
+          // stays in the EMERGENCY fit check (src/index.ts), where the question is the
+          // post-fold live size, not the marginal re-prefill.
+          foldCostTokens: suffix[endIndex + 1] ?? 0,
         })
       } catch {
         // Cannot be balanced into a compressible span — skip.
@@ -1414,7 +1782,23 @@ export function buildCompressibleSeqRanges(
   // move as new messages land), so the model can consume ranges front-to-back
   // without re-ranking each nudge — matching the kernel's `oldest first` list
   // and the host's own front-to-back compression rhythm.
-  return out.sort((a, b) => a.start - b.start)
+  out.sort((a, b) => a.start - b.start)
+  // The kernel can hand several ref edges (multi-call sub-ids) for ONE seq range, so the
+  // same span arrives more than once — measured 52 duplicate rows costing 4,559 bytes in a
+  // single session. Dedupe HERE, at the single source every caller reads, not in one
+  // renderer: `compactForOverflow` sums `remainingReclaim` over this list, and a span
+  // counted twice inflated the "still reachable" projection so the unreachable-remainder
+  // early stop never fired and the loop burned permanent barriers for nothing (round-16
+  // review Q2). `range !== best` cannot catch it — the duplicates are distinct objects.
+  const seenSpans = new Set<string>()
+  const unique: SeqCompressibleRange[] = []
+  for (const range of out) {
+    const key = `${range.start}..${range.end}`
+    if (seenSpans.has(key)) continue
+    seenSpans.add(key)
+    unique.push(range)
+  }
+  return unique
 }
 
 /**
@@ -1426,6 +1810,15 @@ export function buildCompressibleSeqRanges(
  * nudge's range table both surface this so compress edges can be located
  * without blind probing.
  */
+/**
+ * Tokens visible on the surface right now, priced by the SAME implementation as
+ * the range rows (so a refusal and an offer cannot disagree). Used to calibrate
+ * the local estimate against the provider-billed input (src/index.ts fit check).
+ */
+export function surfaceTokens(session: Session): number {
+  return surfaceSuffixTokens(session)[0] ?? 0
+}
+
 export function surfaceSummary(session: Session): string {
   const nodes = session.surface.nodes
   if (nodes.length === 0) return 'empty'

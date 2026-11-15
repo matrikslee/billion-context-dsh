@@ -77,15 +77,16 @@ for (const peerName of seamPeers) {
 	const peerRange = pkg.peerDependencies[peerName]
 	assert.equal(typeof peerRange, 'string', `${peerName} must be declared as a peer (runtime VALUE-import)`)
 
-	test(`${peerName}: peer range accepts the verified 0.2.2+ seam band (0.2.2 → 0.2.x)`, () => {
+	test(`${peerName}: peer range accepts the verified seam band (0.2.1 → 0.2.x)`, () => {
 		// Every published version from the 0.1.5 floor through the 0.2.0
 		// ceiling installs — including the live desktop builds from issue #136
 		// (0.1.5-alpha.2) and the issue #190 reporter's host (0.2.0-rc.2).
 		// Future same-line rCs stay in range, so new releases on an admitted
 		// line never break installs.
 		for (const v of [
-			'0.2.2-alpha.1', '0.2.2-alpha.2', '0.2.2-rc.1', '0.2.2-rc.99', '0.2.2',
-			'0.2.3-rc.1', '0.2.3-alpha.1',
+			// The floor itself and every same-line step after it, prereleases included.
+			'0.2.1-rc.1', '0.2.1', '0.2.2-alpha.0', '0.2.2-alpha.1', '0.2.2-alpha.2',
+			'0.2.2-rc.1', '0.2.2-rc.99', '0.2.2', '0.2.3-rc.1', '0.2.3-alpha.1',
 		]) {
 			assert.equal(
 				semver.satisfies(v, peerRange, { includePrerelease: true }),
@@ -107,9 +108,11 @@ for (const peerName of seamPeers) {
 				`${v} must NOT satisfy ${peerRange}`,
 			)
 		}
-		// Next line and beyond: 0.2.1+ (any prerelease or final) and 0.3.x are
-		// deliberate, later decisions — never silently allowed (house rule).
-		for (const v of ['0.2.2-alpha.0', '0.3.0-rc.1', '0.3.0', '0.4.0']) {
+		// Above the ceiling: 0.3.x and 0.4.x (any prerelease or final) are
+		// deliberate, later decisions — never silently allowed (house rule). A
+		// same-line prerelease such as 0.2.2-alpha.0 is NOT a next line: the
+		// `-0` floor admits it, and the accept list above already pins it.
+		for (const v of ['0.3.0-rc.1', '0.3.0', '0.4.0']) {
 			assert.equal(
 				semver.satisfies(v, peerRange, { includePrerelease: true }),
 				false,
@@ -136,7 +139,10 @@ test('cordis peer range admits the host prerelease line under BOTH semver modes'
 	// `4.0.6-alpha.1`, and the OLD range `^4.0.1` did NOT satisfy that under
 	// plain semver (a prerelease only satisfies a comparator carrying a
 	// prerelease of the same [major,minor,patch] tuple) — `>=4.0.1`,
-	// `>=4.0.1-0` and `>=4.0.1 <5.0.0` were all `false`. The host's install
+	// `>=4.0.1-0` and `>=4.0.1 <5.0.0` were all `false`. The floor therefore
+	// carries the `-0` suffix (`>=4.0.6-0`): it names the verified tuple so the
+	// prerelease resolves under plain semver too, and it is STRICTLY above
+	// 4.0.5 so the unverified older cordis stays out of contract. The host's install
 	// gate is lenient (`@deepseek-ai/dsh-app-boot/lib/index.js:399` calls
 	// `semver.satisfies(version, range, { includePrerelease: true })`), so
 	// installs worked, but pnpm's own static peer check speaks plain semver and

@@ -23,6 +23,8 @@ function makeEnv(limit = 128000, windowFor?: (agent: Agent) => Promise<AcpWindow
     kernel: createCore({}) as CompressionCore,
     store: new AcpStateStore(),
     modelContextLimit: limit,
+    // Human-command tests exercise ledger and paging, not the floor guard.
+    foldFloorPct: 0,
     // Engine-level defaults (src/index.ts DEFAULT_CONFIG): the nudge line the
     // human panel reports must match what the engine actually ships.
     nudgeMaxContextLimitPct: 0.7,
