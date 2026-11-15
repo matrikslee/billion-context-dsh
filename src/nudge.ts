@@ -28,13 +28,15 @@ import {
   findOpenTurn,
   summarySeqOfKernelBlock,
   surfaceSummary,
+  type FoldPricing,
   type KernelRangeView,
   type MediaPriceOf,
   type SeqCompressibleRange,
 } from './region.ts'
 import { mediaPriceViaMeter } from './host-tokens.ts'
+import { costSinceLastCompress, providerUsage, requestOverhead, type ProviderUsage } from './usage.ts'
 import { sessionEventsOf } from './session-events.ts'
-import { kernelConfigFor, type KernelConfigInput } from './config.ts'
+import { foldPricingFor, kernelConfigFor, type KernelConfigInput } from './config.ts'
 import { DEFAULT_RESOLVED, renderTemplate, type ResolvedPrompts } from './prompts.ts'
 import { PTC_LEAK_CORRECTION, ptcText, type ResolvedCallStyle } from './ptc.ts'
 
@@ -127,10 +129,19 @@ function kernelRangeViewOf(nudge: NudgeDecision, state: CompressionState): Kerne
  * (issue #117). Counts, not prices: the price sits in the token column.
  */
 function mediaSuffixOf(range: SeqCompressibleRange): string {
-  if (range.images === 0 && range.files === 0) return ''
+  if (range.images === 0 && range.files === 0 && range.spills === 0 && !range.belowFloor) return ''
   const parts: string[] = []
   if (range.images > 0) parts.push(`+${range.images} image${range.images === 1 ? '' : 's'}`)
   if (range.files > 0) parts.push(`+${range.files} file${range.files === 1 ? '' : 's'}`)
+  // Spilled overflow is the opposite signal from an image: the bytes are NOT in
+  // the context and are still on disk, so folding this row loses nothing the
+  // model cannot re-read narrow. Named last because it argues FOR the fold.
+  if (range.spills > 0) parts.push(`${range.spills} spilled`)
+  // The opposite warning: this row would leave the model with too little room to
+  // work in. Fold a row that still leaves the floor — or fold nothing — rather than
+  // strand the working set; the widest row is the one that strands it (round-4 Q1).
+  // See DEFAULT_FOLD_FLOOR_PCT in src/region.ts.
+  if (range.belowFloor) parts.push('below floor')
   // ` | ` is the separator the same row already uses for the tool/text share
   // column (`[tool X% | text Y%]`) and the one AGENTS.md rule 19 documents; a
   // comma inside the bracket reads as prose.
@@ -169,11 +180,23 @@ export function rangeTable(
   kernelView: KernelRangeView,
   prompts: ResolvedPrompts = DEFAULT_RESOLVED,
   mediaPriceOf?: MediaPriceOf,
+  foldPricing?: FoldPricing,
 ): string {
+  // Duplicate spans (the kernel's multi-call sub-id edges for ONE seq range) are removed by
+  // `buildCompressibleSeqRanges` itself, so the six rows the model sees are six different
+  // stretches of work AND every other caller sees the same deduped list — one source, no
+  // second filter to drift out of sync (round-16 review Q2).
   const ranges = buildCompressibleSeqRanges(
     session,
     kernelView,
-    mediaPriceOf === undefined ? {} : { mediaPriceOf },
+    {
+      ...(mediaPriceOf === undefined ? {} : { mediaPriceOf }),
+      // A row's price is the surface suffix after its END edge. The fixed request
+      // head sits BEFORE every rewrite point, so a warm cache reuses it and adding
+      // the paired overhead here double-counted it (round-10 review B1; the older
+      // overhead-inclusive price still read ~2.8x under on a real fold).
+      foldPricing,
+    },
   ).slice(0, 6)
   // 零范围:整块省略(保留现状的提前返回与 nudge 尾部 '\n')。
   if (ranges.length === 0) return ''
@@ -186,6 +209,7 @@ export function rangeTable(
       toolPct: range.toolPct,
       textPct: 100 - range.toolPct,
       media: mediaSuffixOf(range),
+      foldCost: range.foldCostTokens,
     }),
   )
   return [
@@ -360,6 +384,8 @@ export function buildNudge(
     // The correction rides the nudge the engine is already injecting — no extra
     // message, no extra injection surface (the leak is otherwise silent).
     style === 'ptc' && env.ptcLeakNote === true,
+    providerUsage(agent),
+    foldPricingFor(env),
   )
   const message = createUserMessage({
     content: [{ type: 'text', text }],
@@ -396,13 +422,15 @@ export function buildNudgeText(
   mediaPriceOf?: MediaPriceOf,
   style: ResolvedCallStyle = 'native',
   leakNote = false,
+  usage?: ProviderUsage,
+  foldPricing?: FoldPricing,
 ): string {
   // A host override of any nudge slot → template rendering (config.prompts
   // keeps its v0.1.9 contract: custom copy wins). Only the pristine default
   // reference reaches the kernel path.
   const text = prompts.nudge !== DEFAULT_RESOLVED.nudge
-    ? renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf, style)
-    : adaptKernelNudgeToSeq(renderNudgeText(nudge).text, nudge, session, kernelView, prompts, mediaPriceOf, style)
+    ? renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf, style, usage, foldPricing)
+    : adaptKernelNudgeToSeq(renderNudgeText(nudge).text, nudge, session, kernelView, prompts, mediaPriceOf, style, usage, foldPricing)
   // A leaked direct call produced no call and no error (its markup landed as
   // assistant text), so the nudge we are already injecting is the only channel
   // that can name the failure. Gated on the mode: in native mode the direct
@@ -432,6 +460,8 @@ function adaptKernelNudgeToSeq(
   prompts: ResolvedPrompts,
   mediaPriceOf?: MediaPriceOf,
   style: ResolvedCallStyle = 'native',
+  usage?: ProviderUsage,
+  foldPricing?: FoldPricing,
 ): string {
   // B6：先摘掉哲学/规则段（它们住在系统提示与工具描述里），再做 seq 适配
   let out = stripNudgeGuidance(text)
@@ -447,7 +477,7 @@ function adaptKernelNudgeToSeq(
   // Replace the ref-ID range table (mNNNNN) with the surface-seq table.
   // A zero-range table leaves the kernel's own "[No specific ranges detected]"
   // notice intact — it is a better prompt than an empty table.
-  const seqTable = rangeTable(session, kernelView, prompts, mediaPriceOf)
+  const seqTable = rangeTable(session, kernelView, prompts, mediaPriceOf, foldPricing)
   if (seqTable !== '') out = replaceRangesStr(out, seqTable)
   out = insertContentFormNote(out, style)
   // PTC: the kernel copy names the direct-call shape the host rejects, so the
@@ -481,6 +511,20 @@ function insertContentFormNote(text: string, style: ResolvedCallStyle): string {
   const tipAt = text.lastIndexOf('\n\n\u{1F4A1} ')
   if (tipAt === -1) return text
   return text.slice(0, tipAt) + '\n\n' + contentFormNote(style) + text.slice(tipAt)
+}
+
+
+/**
+ * The rewrite-cost line: what the last compress cost in uncached input, and the
+ * reason it costs anything. Rendered only when the host reports usage AND a
+ * compress has been recorded in this session, so a fresh or meter-less session
+ * keeps the nudge byte-identical to before.
+ */
+function cacheCostLine(prompts: ResolvedPrompts, session: import('@deepseek-ai/dsh-session').Session, usage: ProviderUsage | undefined): string {
+if (prompts.nudge.cacheCost === '') return ''
+const cost = costSinceLastCompress(session, usage)
+if (cost === null) return ''
+return renderTemplate(prompts.nudge.cacheCost, { uncached: cost.delta, count: cost.count })
 }
 
 /** Replace the kernel rangesStr segment (`Compressible ranges (N, oldest first):…`) with our seq table. */
@@ -556,6 +600,8 @@ function renderNudgeFromTemplates(
   prompts: ResolvedPrompts,
   mediaPriceOf?: MediaPriceOf,
   style: ResolvedCallStyle = 'native',
+  usage?: ProviderUsage,
+  foldPricing?: FoldPricing,
 ): string {
   // Cap the reported percentage at 100: a broken measurement (e.g. response
   // pressure folded in) must never surface as an absurd "230%" to the model.
@@ -610,7 +656,9 @@ function renderNudgeFromTemplates(
     parts.push('', tierRules)
   } else {
     // Range table for non-tier nudges (DSH-specific: seq-based, not ref-ID-based).
-    parts.push(rangeTable(session, kernelView, prompts, mediaPriceOf))
+    const cacheCostText = cacheCostLine(prompts, session, usage)
+    if (cacheCostText !== '') parts.push(cacheCostText)
+    parts.push(rangeTable(session, kernelView, prompts, mediaPriceOf, foldPricing))
   }
 
   // Batch-compress tip (from kernel's nudge-text.ts style). The array-form

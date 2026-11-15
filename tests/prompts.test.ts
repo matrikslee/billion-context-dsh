@@ -130,7 +130,7 @@ test('M4/prompts 2b: default nudge renders through the kernel renderNudgeText pa
   // kernel header format ("N, oldest first") with the seq dialect appended —
   // the kernel mN range rows are what must be gone.
   assert.ok(!text.includes('m00150'), 'kernel ref range sample gone')
-  assert.ok(text.includes('exact surface seqs — usable as-is'), 'seq-dialect title injected')
+  assert.ok(text.includes('Ranges ('), 'seq-dialect title injected')
   assert.ok(text.includes('seq 1..7'), 'surface-seq range table injected')
   assert.ok(text.includes('Surface: 12 nodes, seqs 1..12'), 'surface summary present')
   // No usage statement; the only mNNNNN tokens are inside kernel's own
@@ -184,12 +184,11 @@ test('M4/prompts 4: range table snapshot (with ranges) and zero-range early retu
   const paged = buildTextSession(12)
   assert.equal(
     rangeTable(paged, wholeSurfaceRangeView(paged)),
-    `\nSurface: 12 nodes, seqs 1..12
-Compressible ranges (1, oldest first; exact surface seqs — usable as-is):
-  - seq 1..7 — 7 messages, ~7227 tokens [tool 0% | text 100%]
-Compress with: compress({ content: [{ startSeq, endSeq, summary }] }) — content is an array: batch multiple unrelated segments in one call, each entry its own block. Keep ranges disjoint.
-Snapshot taken at nudge time: the seqs go stale once the surface moves (a later compress shadows them), so re-run acp_status for fresh refs before compressing.
-Before you compress any row above, confirm it is truly consumed — if a span still holds live task state (where you are in the task / open TODOs, paths already ruled out, artifacts already done and where they live), carry that state into your summary or keep the span live. Compressing an in-progress span without carrying its state forces a full re-run afterward.`,
+    `
+Surface: 12 nodes, seqs 1..12
+Ranges (1, oldest first; seqs usable as-is):
+  - seq 1..7 · 7msg ~7227t tool0% · fold ~5164
+fold = re-prefilling every token AFTER the rewrite point, paid ONCE (the fixed request head sits before every rewrite point, so a warm cache reuses it; an injected row that landed AFTER the rewrite point is inside this price); batch rows into ONE call and prefer the LATEST consumed rows (an earlier rewrite point re-reads more). compress({ content: [{ startSeq, endSeq, summary }] }); stale seqs mean re-run acp_status. A row marked N spilled has its bytes on a FILE, still readable from disk, so folding it loses nothing. A row marked below floor strands the working set — fold a row that STILL LEAVES the floor, or read from files. Only fold spans you have fully consumed: carry their open TODOs and artifact paths into the summary, or leave them live.`
   )
 })
 
@@ -197,11 +196,11 @@ test('M4/prompts 5: tool descriptions render the defaults byte-identical', () =>
   const descriptions = Object.fromEntries(makeTools(makeEnv(128000)).map((t) => [t.name, t.description]))
   assert.equal(
     descriptions['compress'],
-    'Replace older conversation ranges with dense summaries you write. Each message seq is a surface reference. Single range: compress({ content: [{ startSeq, endSeq, summary }] }). Batch multiple unrelated ranges in one call (each content entry becomes its own block); keep ranges disjoint. Never compress content the current step is actively using. Compress boundaries are SURFACE SEQS (acp_status Surface: row, latest nudge table) — NOT the block refs (bN, e.g. b1) that acp_status COMPRESSED BLOCKS shows, which are for decompress only. Drilldown mN refs (e.g. m00306) are ALSO accepted as startSeq/endSeq — they are auto-mapped to the live surface seq; an unknown mN (never assigned on the current surface) fails with guidance. Seq refs must come from the CURRENT surface (acp_status or the latest nudge): a span whose edges were shadowed by an earlier compress is auto-remapped to its still-live content, a fully compressed span is reported as already compressed, and invented/other-session seqs fail with guidance. Good compression moments: stage or subtask completion whose details you have fully consumed and will not re-check, strategy switches, intermediate milestones, and wrapping up failed exploration — when the details are consumed and no longer critical for the task ahead. Before compressing, ask: will I need to re-verify any detail from this range in this task? If yes, keep it live. When you write a summary, turn dead-end exploration into a conclusion (what was tried, why it failed, the next step) — not a blow-by-blow; and keep the summary the ONLY record: self-contained, so a later reader (or you, after decompress) can continue without the original. Optional verifiedReadings: string[] per content entry records acceptance readings that are already green (e.g. "t0-fastpath 8/8") — stored structurally on the compaction event so later steps need not re-run them.',
+    'Replace older conversation ranges with dense summaries you write. Each message seq is a surface reference. Single range: compress({ content: [{ startSeq, endSeq, summary }] }). Batch multiple unrelated ranges in one call (each content entry becomes its own block); keep ranges disjoint. Never compress content the current step is actively using. Compress boundaries are SURFACE SEQS (acp_status Surface: row, latest nudge table). The block refs (bN, e.g. b1) that acp_status COMPRESSED BLOCKS shows are ALSO valid boundaries — naming the checkpoint node of a block is exactly how you DISTILL that block (tier 2/3); decompress takes the same bN. Drilldown mN refs (e.g. m00306) are ALSO accepted as startSeq/endSeq — they are auto-mapped to the live surface seq; an unknown mN (never assigned on the current surface) fails with guidance. Seq refs must come from the CURRENT surface (acp_status or the latest nudge): a span whose edges were shadowed by an earlier compress is auto-remapped to its still-live content, a fully compressed span is reported as already compressed, and invented/other-session seqs fail with guidance. Good compression moments: stage or subtask completion whose details you have fully consumed and will not re-check, strategy switches, intermediate milestones, and wrapping up failed exploration — when the details are consumed and no longer critical for the task ahead. Before compressing, ask: will I need to re-verify any detail from this range in this task? If yes, keep it live. When you write a summary, turn dead-end exploration into a conclusion (what was tried, why it failed, the next step) — not a blow-by-blow; and keep the summary the ONLY record: self-contained, so a later reader (or you, after decompress) can continue without the original. Optional verifiedReadings: string[] per content entry records acceptance readings that are already green (e.g. "t0-fastpath 8/8") — stored structurally on the compaction event so later steps need not re-run them. Engine-picked fold: compress({ condense: { summary } }) lets the engine elect the LARGEST eligible continuous run of the current surface and fold it in ONE replace while you write the handoff note — that note must carry ## Goal and ## Next. A fold makes the next request re-prefill every token AFTER the rewrite point ONCE, so the rewrite point IS the lever: prefer the LATEST consumed stretch and batch consumed spans into one call rather than folding small spans repeatedly.',
   )
-  assert.equal(descriptions['decompress'], 'Recover the original content of a compressed block by its blockId — the kernel block ref `bN` shown by acp_status (e.g. b1), or a compaction id from search_context (read-only; does not unshadow the range). Large blocks are paged so each page stays under the host tool-result trim budget (up to 100 messages per call): pass offset/limit to walk them and follow the continue hint in the result.')
+  assert.equal(descriptions['decompress'], 'Recover the original content of a compressed block by its blockId — the kernel block ref `bN` shown by acp_status (e.g. b1), or a compaction id from search_context (read-only; does not unshadow the range). Large blocks are paged so each page stays under the host tool-result trim budget (up to 100 messages per call): pass offset/limit to walk them and follow the continue hint in the result. Pass the narrowest page that answers the question (offset/limit) and locate the part you need with search_context first — a full dump re-pays every byte the fold removed.')
   assert.equal(descriptions['search_context'], 'Search inside compressed blocks (summaries and original content) for information the model no longer sees in context. When a summary lacks a detail you need (exact values, error strings, decisions, verbatim code), SEARCH the compressed blocks FIRST — never guess or reconstruct from memory: search_context(query) locates the right block, then decompress only that block to recover the original.')
-  assert.equal(descriptions['acp_status'], 'Context status: overview of the current context — CONTEXT BREAKDOWN (tool/text/summaries token shares of the visible total), COMPRESSED BLOCKS ledger, and the nudge decision. No args = overview. Percentages are shares of the visible content, not the context window. Note: the block refs in COMPRESSED BLOCKS (bN, e.g. b1) are for decompress; compress uses the Surface: seq range, not bN. Drilldown: pass scope:"compressed" for a per-block list, or scope:"uncompressed" with view:"messages" (every visible message) / view:"ranges" (merged ranges); tool filters to one tool name, sort reorders (size/time/tool; age for compressed), limit caps rows (default 30). Drilldown row refs are kernel ids (mN) — feed them straight to compress as startSeq/endSeq (auto-mapped to the live surface seq); bN is for decompress, Surface: seqs also work in compress.')
+  assert.equal(descriptions['acp_status'], 'Context status: overview of the current context — CONTEXT BREAKDOWN (tool/text/summaries token shares of the visible total), COMPRESSED BLOCKS ledger, and the nudge decision. No args = overview. Percentages are shares of the visible content, not the context window. Note: the block refs in COMPRESSED BLOCKS (bN, e.g. b1) work in BOTH tools — decompress reads the block, and compress accepts bN as a boundary to DISTILL that block (tier 2/3); plain spans use the Surface: seq range. Drilldown: pass scope:"compressed" for a per-block list, or scope:"uncompressed" with view:"messages" (every visible message) / view:"ranges" (merged ranges); tool filters to one tool name, sort reorders (size/time/tool; age for compressed), limit caps rows (default 30). Drilldown row refs are kernel ids (mN) — feed them straight to compress as startSeq/endSeq (auto-mapped to the live surface seq); bN also works as a compress boundary (it distills that block), Surface: seqs cover plain spans.')
 })
 
 test('M4/prompts 5b: default compress description ships the #43 semantic-timing and actionable-summary guidance', () => {
@@ -306,11 +305,11 @@ test('M4/prompts 5e: liveness-aware compression carriers ship in the range-table
   const paged = buildTextSession(12)
   const table = rangeTable(paged, wholeSurfaceRangeView(paged))
   assert.ok(
-    table.includes('Before you compress any row above, confirm it is truly consumed'),
+    table.includes('Only fold spans you have fully consumed'),
     'action-zone liveness reminder present in the range-table footer (issue #149)',
   )
   assert.ok(
-    table.includes('artifacts already done and where they live'),
+    table.includes('open TODOs and artifact paths'),
     'footer names ruled-out paths + artifact locations (issue #149)',
   )
 })
@@ -500,4 +499,16 @@ test('M4/prompts 15: engine construction fails fast on a template typo', () => {
   // Group-level null from YAML-ish input is tolerated (whole group falls back).
   const engine = new Named(new Context(), { prompts: { nudge: null } } as never)
   assert.equal(engine.prompts.nudge.normal, DEFAULT_PROMPTS.nudge.normal)
+})
+
+/**
+ * Round-12 review Q9.6: the whitelist for `rangeTable.line` listed the retired `rewriteCost`
+ * slot while the default template renders `{foldCost}` — a user copying the default string into
+ * a custom `prompts.rangeTable.line` (or writing `{foldCost}` themselves) threw at startup.
+ */
+test('M4/prompts: a custom rangeTable.line may use the {foldCost} slot the default renders', () => {
+  const resolved = resolvePrompts({
+    rangeTable: { line: '  - seq {start}..{end} \u00b7 {count}msg ~{tokens}t tool{toolPct}%{media} \u00b7 fold ~{foldCost}' },
+  })
+  assert.match(resolved.rangeTable.line, /fold ~\{foldCost\}/)
 })

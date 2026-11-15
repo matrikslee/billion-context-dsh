@@ -81,7 +81,7 @@ test('PTC 2: native mode is byte-identical — nothing the PTC work adds leaks i
   assert.ok(!rendered.includes(PTC_SYSTEM_LINE.slice(0, 40)), 'no PTC convention line in the native system prompt')
   assert.ok(!DEFAULT_PROMPTS.tools.compress.includes('await tools.'), 'native compress description unchanged')
   assert.ok(DEFAULT_PROMPTS.tools.compress.includes('Single range: compress({ content'), 'native call shape intact')
-  assert.ok(DEFAULT_PROMPTS.rangeTable.footer.startsWith('Compress with: compress({'), 'native footer shape intact')
+  assert.ok(DEFAULT_PROMPTS.rangeTable.footer.startsWith('fold = re-prefilling'), 'native footer shape intact')
   assert.equal(ptcText(rendered, 'native'), rendered, 'ptcText is identity in native mode')
 })
 

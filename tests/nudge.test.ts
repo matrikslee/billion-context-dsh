@@ -37,6 +37,10 @@ function makeEnv(limit: number): ToolEnvironment {
     kernel: createCore({}) as CompressionCore,
     store: new AcpStateStore(),
     modelContextLimit: limit,
+    // This file tests nudge copy and tiers, not fold pricing: an 8K window would
+    // otherwise clamp the working-set floor to its 8K minimum and refuse the
+    // tier-1 compressions this fixture needs to exist.
+    foldFloorPct: 0,
   }
 }
 
@@ -169,10 +173,10 @@ test('M4: a normal nudge does not consume the emergency budget (issue #108)', ()
 test('M4: range table is computed from the surface, skipping the protected tail', () => {
   const session = buildTextSession(12)
   const text = rangeTable(session, wholeSurfaceRangeView(session))
-  assert.match(text, /Compressible ranges/)
+  assert.match(text, /Ranges \(/)
   assert.match(text, /Surface: 12 nodes, seqs 1\.\.12/, 'the range table also reports the surface span so edges are locatable')
   // The protected recent tail (last 5 messages) is skipped; older runs appear.
-  assert.match(text, /seq \d+\.\.\d+ — \d+ messages/)
+  assert.match(text, /seq \d+\.\.\d+ \u00b7 \d+msg/)
   assert.doesNotMatch(text, /65000/)
 })
 
