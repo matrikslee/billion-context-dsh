@@ -936,6 +936,12 @@ interface DecompressArgs {
 function resolveBlockId(session: Session, arg: string): string | null {
   const byKernelRef = blockIdOfKernelRef(session, arg)
   if (byKernelRef !== null) return byKernelRef
+  // A canonical `bN` form is NEVER read as a compaction-id prefix. `blockIdOfKernelRef` already
+  // refused it (no active block carries that ref), and compaction ids are UUIDs whose leading
+  // chars are hex — `b01` is itself a valid UUID prefix, so falling through to the prefix scan
+  // resolved a malformed ref to a real block with probability 1/16^len (round-14 review Q6: the
+  // one-off `M3` flake, unreproducible by construction).
+  if (/^b\d+$/.test(arg)) return null
   const ledger = rebuildBlockLedger(sessionEventsOf(session))
   const byPrefix = ledger.find((entry) => entry.blockId.startsWith(arg))
   return byPrefix?.blockId ?? null

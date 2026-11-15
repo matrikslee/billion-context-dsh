@@ -46,7 +46,7 @@ export interface RangeTablePrompts {
   header: string
   /** 标题。占位符:{count}(表格行数) */
   title: string
-  /** 每行。占位符:{start} {end} {count} {tokens} */
+  /** 每行。占位符:{start} {end} {count} {tokens} {toolPct} {textPct} {media} {foldCost} */
   line: string
   /** 表尾调用语法。无占位符 */
   footer: string

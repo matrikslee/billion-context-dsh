@@ -18,6 +18,9 @@ function makeEnv(limit = 128000): ToolEnvironment {
     kernel: createCore({}) as CompressionCore,
     store: new AcpStateStore(),
     modelContextLimit: limit,
+    // Tool-wiring tests build tiny fixtures; the working-set floor is tested in
+    // fold-floor.test.ts with a surface sized to clear it.
+    foldFloorPct: 0,
     compressCallIdsToHide: new Set(),
   }
 }
@@ -359,6 +362,10 @@ test('M3: decompress malformed or unknown bN forms are not found, not normalised
 
   const decompress = toolOf(env, 'decompress')
   // Unknown ref, zero-padded ref, and uppercase are all NOT the canonical bN.
+  // Round-14 review Q6: compaction ids are UUIDs, and `b01` is a legal UUID prefix, so the
+  // compaction-id prefix fallback used to resolve such a probe to a REAL block with probability
+  // 1/16^len — that was the one-off flake. `resolveBlockId` now refuses every canonical `bN`
+  // form outright, so this loop is deterministic by construction.
   for (const arg of ['b99', 'b0', 'b01', 'B1', 'b1 ', 'b1x']) {
     const result = await decompress.execute({ blockId: arg }, fakeExec(session))
     assert.match((result as { text: string }).text, /not found \(see acp_status/, `"${arg}" must be reported not found`)

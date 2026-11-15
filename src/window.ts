@@ -148,9 +148,13 @@ export function liveRoute(agent: Agent): { provider: string; model: string } | n
  */
 export function routeFor(agent: Agent): { provider: string; model: string } {
   const live = liveRoute(agent)
+  // `options` optional-chained: `routeFor` now runs inside `agent/pre-step` (the calibration
+  // route key, round-14 review Q8a) where this function's contract is that it never throws, and a
+  // detached or host-lite agent without an options snapshot must degrade to the empty route
+  // instead of crashing the step.
   return {
-    provider: live?.provider ?? agent.options.provider ?? '',
-    model: live?.model ?? agent.options.model ?? '',
+    provider: live?.provider ?? agent.options?.provider ?? '',
+    model: live?.model ?? agent.options?.model ?? '',
   }
 }
 
