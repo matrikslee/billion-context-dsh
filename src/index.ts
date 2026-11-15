@@ -51,9 +51,13 @@ import { DEFAULT_CONTEXT_WINDOW, probeModelWindow, projectedContextWindow, route
 import {
   buildCompressibleSeqRanges,
   deferCompressPairHide,
+  foldSpanPricing,
+  surfaceTokens,
   runCompactionTransaction,
   shadowedSeqsOf,
   stripOrphanedSurfaceToolMessages,
+  pruneStaleNudgeRows,
+  openToolCallIds,
   type KernelRangeView,
 } from './region.ts'
 import { allLogMessages, eventsToCoreMessages, extractEventText, overflowMarkerSummary, surfaceEventsOf, toolCallIdOfResultEvent } from './messages.ts'
@@ -65,7 +69,40 @@ import {
   type ToolCallStyle,
 } from './ptc.ts'
 import { shadowedTokensViaMeter } from './host-tokens.ts'
-import { kernelConfigFor } from './config.ts'
+import { foldPricingFor, kernelConfigFor } from './config.ts'
+import {
+  DEFAULT_OVERFLOW_INFLATION,
+  lastRequestUsage,
+  pairedInflation,
+  calibrateRequestPair,
+  requestOverhead,
+  setCalibrationAnchor,
+  setCalibrationRoute,
+} from './usage.ts'
+
+/**
+ * Ceiling on the smallest reclaim worth a full re-prefill on the emergency path.
+ * A fold leaves a permanent un-foldable barrier, so a 1K reclaim in a large
+ * window buys 1K of relief for one barrier — the worst barrier-per-byte ratio
+ * possible (cross-review Q5).
+ *
+ * It is a CEILING, not a floor: the meaningful minimum is a fraction of the
+ * window (OVERFLOW_FOLD_WINDOW_RATIO) capped by this number. An absolute floor
+ * is unreachable on a small window — the e2e overflow-recovery scenario runs at
+ * modelContextLimit 2000, so a hard 4096 made the emergency path refuse every
+ * fold and disabled overflow recovery exactly where it matters most. Same class
+ * of mistake the cross-review flagged for the degrade threshold (round-4 Q2).
+ */
+const MIN_OVERFLOW_FOLD_TOKENS = 4096
+const OVERFLOW_FOLD_WINDOW_RATIO = 0.1
+/**
+ * How many disjoint spans one overflow recovery may fold inside a SINGLE retry (round-11
+ * review Q5). The retry budget is separate and stays at the host default of 1: extra passes
+ * cost barriers and re-prefill, never a retry. 3 is a ceiling against a pathological surface
+ * where every span is barely above the minimum — the loop already stops as soon as the
+ * projection fits or no eligible span remains, so this only bounds the worst case.
+ */
+const OVERFLOW_FOLD_PASSES = 3
 import {
   ACP_SETTINGS_NAMESPACE,
   AcpPluginConfigSchema,
@@ -754,7 +791,21 @@ export class AcpCompactionEngine extends CompactionEngine {
       // low-pressure session never hits the orphan 400 (issue #18). No call is
       // in flight at pre-step (the previous step's tools all landed), so the
       // default empty in-flight set is safe.
+      // Order is load-bearing (round-8 review, all three models): clear our own
+      // stale nudge rows BEFORE the orphan/broken-pair strip, so a nudge that used to
+      // sit between a tool call and its result stops making that pair look broken —
+      // the strip must never delete a real tool result to fix a row we authored.
+      pruneStaleNudgeRows(payload.agent.session)
       stripOrphanedSurfaceToolMessages(payload.agent.session)
+      // Calibration pair for the emergency fit check (src/usage.ts): the newest billed
+      // request against the surface of the step that PRODUCED it. Pairing it with THIS
+      // step's surface would compare two moments — the surface already carries the
+      // previous step's output, so both the ratio and the absolute overhead shrink
+      // toward zero and the fit check under-quotes a fold that still overflows
+      // (round-10 review S2). calibrateRequestPair carries the previous surface.
+      setCalibrationRoute(payload.agent.session, `${routeFor(payload.agent).provider}/${routeFor(payload.agent).model}`)
+      const billed = lastRequestUsage(payload.agent.session)
+      calibrateRequestPair(payload.agent.session, billed?.tokens ?? 0, billed?.seq ?? 0, surfaceTokens(payload.agent.session))
       // Hot-apply settings BEFORE any knob is read this step (issue #193): on
       // the forms line, writes committed between steps land in our volatile
       // refs with no event we receive — this re-read is what applies them.
@@ -784,6 +835,12 @@ export class AcpCompactionEngine extends CompactionEngine {
       if (!engine.readSettingsSource().autoNudge) return next()
       const decision = await next()
       if (decision.kind === 'reject') return decision
+      // Never append a nudge while a tool call of this step is still OPEN: the row would
+      // land BETWEEN the call and its result, which strict providers reject and which
+      // rule 8 used to resolve by deleting the real pair (round-8 review, named the
+      // ship-blocking bug at the source). One step later the results have landed and
+      // the same table is just as actionable — pressure never depends on this step.
+      if (openToolCallIds(payload.agent.session).size > 0) return decision
       const window = await this.windowFor(payload.agent)
       const outcome = buildNudge(
         payload.agent,
@@ -1124,84 +1181,236 @@ export class AcpCompactionEngine extends CompactionEngine {
   private async compactForOverflow(agent: Agent, signal: AbortSignal): Promise<OverflowRecoveryResult | null> {
     signal.throwIfAborted()
     const session = agent.session
-    const state = this.store.stateFor(session)
-    const coreMessages = allLogMessages(session)
     const surfaceMessages = eventsToCoreMessages(surfaceEventsOf(session))
     const tokenCount = resolveTokenCount(agent, surfaceMessages)
     const window = await this.windowFor(agent)
     const config = kernelConfigFor({ ...this.env, modelContextLimit: window.limit })
-    // processTurn assigns the mNNNNN ref map the kernel transaction needs
-    // (the same contract handleCompress relies on); renderTags 'none' keeps
-    // message text untouched — we read the ref map directly.
-    const turn = this.kernel.processTurn({ messages: coreMessages, state, config, tokenCount, renderTags: 'none' })
-    this.store.set(session, turn.state)
-    const byRaw = turn.state.messageRefs.byRaw
-    // One kernel range spanning the whole surface: buildCompressibleSeqRanges
-    // applies the host guards (protected tail, last real user turn, CURRENT
-    // instruction rows, checkpoints, the system node) and splits it into
-    // balanced segments — the same geometry the nudge range table offers the
-    // model, so the emergency path can only shadow what the model itself
-    // could have compressed.
-    let firstSeq: number | undefined
-    let lastSeq: number | undefined
-    for (const seq of session.surface.nodes) {
-      if (byRaw[String(seq)] === undefined) continue
-      firstSeq ??= seq
-      lastSeq = seq
+    // The ref map the kernel transaction needs (the same contract handleCompress relies on) is
+    // derived INSIDE `foldPass`, per pass: pass 0 appends a `compaction/summary` plus a
+    // checkpoint node, so a snapshot taken before the loop could not see the surface the next
+    // pass anchors on (round-12 review Q1). Deriving it once here as well only ran
+    // `processTurn` a second time on the same unchanged surface for pass 0 (round-13 review
+    // Q1/Q3a); `renderTags: 'none'` means we read nothing but the ref map.
+    const foldPricing = foldPricingFor(this.env)
+    const minimumFold = Math.min(
+      MIN_OVERFLOW_FOLD_TOKENS,
+      Math.max(1, Math.floor(window.limit * OVERFLOW_FOLD_WINDOW_RATIO)),
+    )
+    // ONE pass folds ONE eligible span. The provider has already rejected the request and the
+    // retry budget is one, so a single insufficient fold used to burn that budget and stall the
+    // session (round-11 review Q5): barriers (an instruction row, a checkpoint, the active turn)
+    // split the surface, so folding the LARGEST span can still leave the projection above the
+    // window while folding a second, disjoint span would fit. Keep folding further disjoint
+    // spans inside the SAME retry — an extra fold costs a barrier and a re-prefill, it costs no
+    // retry, and the projection stays advisory at every pass.
+    const foldPass = (pass: number): {
+      readonly record: OverflowRecoveryResult | null
+      readonly fitRisk: boolean
+      readonly liveAfterTokens: number
+      /** Tokens still foldable AFTER this pass (eligible rows at or above `minimumFold`). */
+      readonly remainingReclaimTokens: number
+      readonly inflation: number
+      readonly overhead: number
+    } => {
+      // Each pass re-reads the log and re-derives the ref map from scratch. Pass 0 appended a
+      // `compaction/summary` plus a checkpoint node to the surface, and reusing the pre-loop
+      // `coreMessages` meant pass 1+ anchored and priced a surface it could not see — the new
+      // nodes were absent from `byRaw`, so its span was built from a stale projection
+      // (round-12 review Q1, both reviewers). `processTurn` is pure state-in/state-out, so
+      // re-running it (at most OVERFLOW_FOLD_PASSES times, no LLM call) is the cheap fix.
+      const messages = allLogMessages(session)
+      const passTurn = this.kernel.processTurn({ messages, state: this.store.stateFor(session), config, tokenCount, renderTags: 'none' })
+      const stateNow = passTurn.state
+      this.store.set(session, stateNow)
+      // One kernel range spanning the whole surface: buildCompressibleSeqRanges
+      // applies the host guards (protected tail, last real user turn, CURRENT
+      // instruction rows, checkpoints, the system node) and splits it into
+      // balanced segments — the same geometry the nudge range table offers the
+      // model, so the emergency path can only shadow what the model itself
+      // could have compressed. The ref map comes from the state THIS pass was handed — after
+      // a pass lands, the kernel state carries the refs of the rewritten surface.
+      const byRaw = stateNow.messageRefs.byRaw
+      let firstSeq: number | undefined
+      let lastSeq: number | undefined
+      for (const seq of session.surface.nodes) {
+        if (byRaw[String(seq)] === undefined) continue
+        firstSeq ??= seq
+        lastSeq = seq
+      }
+      if (firstSeq === undefined || lastSeq === undefined) return { record: null, fitRisk: false, liveAfterTokens: 0, remainingReclaimTokens: 0, inflation: DEFAULT_OVERFLOW_INFLATION, overhead: 0 }
+      const view: KernelRangeView = {
+        ranges: [{ startRef: byRaw[String(firstSeq)]!, endRef: byRaw[String(lastSeq)]! }],
+        refs: { byRef: stateNow.messageRefs.byRef },
+      }
+      // `preserveRecent: 5` is region.ts's own default (the nudge range table's
+      // recent-tail protection), pinned EXPLICITLY here: this path acts without
+      // asking the model, so its safety margin must not silently drift with a
+      // tuning change made for the advisory table.
+      const ranges = buildCompressibleSeqRanges(session, view, {
+        preserveRecent: 5,
+        mediaPriceOf: meterMediaPriceResolver(agent, session),
+        foldPricing,
+      })
+      if (ranges.length === 0) return { record: null, fitRisk: false, liveAfterTokens: 0, remainingReclaimTokens: 0, inflation: DEFAULT_OVERFLOW_INFLATION, overhead: 0 }
+      // Each pass folds one eligible span, largest first (the first pass is host parity),
+      // priced in the same vocabulary as the nudge range table.
+      //
+      // The working-set floor applies here too (cross-review Q6, all three
+      // reviewers): this is the only fold in the system with no model in the loop,
+      // and a too-small emergency fold pays the full one-time re-prefill and then
+      // re-triggers overflow a few turns later. DELIBERATE DIFFERENCE from the
+      // model-facing guard: when EVERY eligible range is below the floor we still
+      // fold the largest one, because refusing here means the provider rejects the
+      // request outright — the session is already out of room, so a shallow working
+      // set beats a hard failure. The model path refuses instead, because it can
+      // choose a wider span or read from files.
+      const aboveFloor = ranges.filter((range) => !range.belowFloor)
+      const pool = aboveFloor.length > 0 ? aboveFloor : ranges
+      const best = pool.reduce((largest, range) => (range.tokens > largest.tokens ? range : largest))
+      // A fold re-prefills everything after its rewrite point (40–52 s measured at
+      // an early rewrite point, ~40 s at a late one). Reclaiming a
+      // trickle cannot buy a usable request, so a tiny election is worse than
+      // letting the retry fail (cross-review Q1) — but the trickle test is
+      // window-relative: on a 2K window the only fold available IS small, and refusing it
+      // means the session dies instead.
+      if (best.tokens < minimumFold) return { record: null, fitRisk: false, liveAfterTokens: 0, remainingReclaimTokens: 0, inflation: DEFAULT_OVERFLOW_INFLATION, overhead: 0 }
+      const priced = foldSpanPricing(session, best.start, best.end, foldPricing)
+      // Fit check, calibrated rather than assumed: our estimate uses this plugin’s
+      // tokenizer, not the engine's, so it is only sound as an upper bound. The
+      // calibration is a PAIRED sample (billed vs the surface estimate of the same
+      // moment, recorded at agent/pre-step) plus the fixed request overhead the
+      // provider bills and we do not count as surface — the system prompt, the tool
+      // registry, host rows. Dividing the PEAK billed request by the CURRENT surface
+      // was the earlier form and it fails both ways (cross-review Q3): on a session
+      // with a large durable prefix the ratio reads 3-4× and refuses forever, while
+      // the overhead the fold cannot remove is missing from the live side, so a fold
+      // that still overflows is accepted. The two factors are DIFFERENT kinds of
+      // error and must not multiply each other (cross-review Q3): the ratio is the
+      // tokenizer gap on the counted part, the overhead is a fixed absolute the fold
+      // can never remove. `(liveAfter + overhead) * ratio` inflated the fixed
+      // overhead by the ratio as well and refused the one fold that could have
+      // saved the request.
+      // The projection is ADVISORY, never a gate: this path only runs when the
+      // provider has ALREADY rejected the request, so refusing here IS the recovery
+      // failure — the budget is one retry, then the original error stands and the
+      // session stalls. What the projection buys is a stamp instead: FIT RISK
+      // rides the marker provenance, so a fold that could not fit stays visible in
+      // the transcript and the block ledger rather than silently never happening.
+      // Measured 2026-11-15: with the same-request calibration (S2) the paired ratio
+      // reads honestly high, and refusing on it deleted the emergency fold in the
+      // e2e overflow scenario outright (five assertions failed — nothing was folded).
+      // A false acceptance costs one re-prefill plus one barrier, at most once per
+      // turn; a false refusal costs a stalled session.
+      const paired = pairedInflation(session)
+      const inflation = paired ?? DEFAULT_OVERFLOW_INFLATION
+      const overhead = requestOverhead(session)
+      const projected = priced.liveAfterTokens * inflation + overhead
+      const fitRisk = projected > window.limit
+      if (fitRisk) {
+        this.ctx.logger.warn(
+          `billion-context-dsh: overflow fold pass ${pass} proceeds with a FIT RISK — projected `
+          + `${Math.round(projected)} > window ${window.limit} (liveAfter `
+          + `${priced.liveAfterTokens}, overhead ${overhead}, inflation ${inflation.toFixed(2)}, `
+          + `${paired === undefined ? String(DEFAULT_OVERFLOW_INFLATION) + " fallback" : "paired sample"})`,
+        )
+      }
+      const provenanceParts: string[] = []
+      if (priced.belowFloor) {
+        provenanceParts.push(`below-floor emergency fold: floor ~${foldPricing.floorTokens ?? 0}, folded ~${priced.spanTokens}, live-after ~${priced.liveAfterTokens}, window ${window.limit}, reason overflow-no-above-floor`)
+      }
+      if (fitRisk) {
+        // Phrased as a PAST observation, not a present-tense claim (round-11 review Q9): this
+        // provenance rides the marker node and stays visible on the surface for the rest of the
+        // session, and a retry that then succeeded left an unfit fold reading "projected 290000
+        // > window 100000" as though the CURRENT context still exceeded the window.
+        provenanceParts.push(`FIT RISK when folding: projected ~${Math.round(projected)} > window ${window.limit}, live-after ~${priced.liveAfterTokens}, overhead ${overhead}, inflation ${inflation.toFixed(2)}, ${paired === undefined ? String(DEFAULT_OVERFLOW_INFLATION) + " fallback" : "paired sample"}`)
+      }
+      const provenance = provenanceParts.length > 0 ? provenanceParts.join("; ") : undefined
+      const startRef = byRaw[String(best.start)]
+      const endRef = byRaw[String(best.end)]
+      if (startRef === undefined || endRef === undefined) return { record: null, fitRisk: false, liveAfterTokens: 0, remainingReclaimTokens: 0, inflation: DEFAULT_OVERFLOW_INFLATION, overhead: 0 }
+      // Engine-written marker: the shared constructor in src/messages.ts is what
+      // makes the projection net exempt it from the model-written frame, so the
+      // model-visible text and the durable/decompress text stay identical.
+      const summary = overflowMarkerSummary(best.count, provenance)
+      const applied = this.kernel.applyCompression({
+        ranges: [{ startRef, endRef, summary, topic: 'context-overflow recovery' }],
+        messages,
+        state: stateNow,
+        config,
+      })
+      if (applied.result.blocksCreated === 0) return { record: null, fitRisk: false, liveAfterTokens: 0, remainingReclaimTokens: 0, inflation: DEFAULT_OVERFLOW_INFLATION, overhead: 0 }
+      // Commit the kernel state only once the durable transaction below can land. The old
+      // ordering wrote it BEFORE the `created === undefined` / `shadowed.length === 0` early
+      // returns, leaving a kernel block in the store with no `compaction/summary` on the
+      // session (round-12 review Q1, both reviewers).
+      const previousIds = new Set(stateNow.blocks.map((block) => block.blockId))
+      const created = applied.state.blocks.find((block) => !previousIds.has(block.blockId))
+      if (created === undefined) return { record: null, fitRisk: false, liveAfterTokens: 0, remainingReclaimTokens: 0, inflation: DEFAULT_OVERFLOW_INFLATION, overhead: 0 }
+      const shadowed = shadowedSeqsOf(session, best.start, best.end)
+      if (shadowed.length === 0) return { record: null, fitRisk: false, liveAfterTokens: 0, remainingReclaimTokens: 0, inflation: DEFAULT_OVERFLOW_INFLATION, overhead: 0 }
+      const shadowedTokenCount = shadowedTokensViaMeter(session, shadowed, agent.ctx)
+      const { provider, model } = routeFor(agent)
+      runCompactionTransaction(session, {
+        start: best.start,
+        end: best.end,
+        shadowedSeqs: shadowed,
+        summary: [{ type: 'text', text: summary }],
+        shadowedTokenCount,
+        provider,
+        model,
+        topic: 'context-overflow recovery',
+        kernelBlockId: created.blockId,
+        directMessageIds: created.directMessageIds,
+        effectiveMessageIds: created.effectiveMessageIds,
+      })
+      this.store.set(session, applied.state)
+      // What is still foldable after this pass: eligible rows the pool offered that are at or
+      // above the minimum reclaim. The loop uses it to stop when NO combination of further
+      // folds can reach the window — folding anyway spends a permanent barrier per pass for a
+      // projection that is mathematically unreachable (round-13 review Q3c), the same failure
+      // `overheadBlocksFit` closes for the fixed-head case.
+      // Summed over EVERY eligible row, not over `pool`. `pool` is `aboveFloor` while any row
+      // clears the floor; after this pass folds one of them the next pass can find `aboveFloor`
+      // EMPTY and fall back to `ranges`, exposing rows this pass never saw (round-14 review Q4:
+      // a 10K above-floor row plus a 24K below-floor row on a 38K surface stopped after one pass
+      // because the snapshot read remainingReclaim 0 while a second fold would have fit).
+      const remainingReclaim = ranges
+        .filter((range) => range !== best && range.tokens >= minimumFold)
+        .reduce((sum, range) => sum + range.tokens, 0)
+      return {
+        record: { start: best.start, end: best.end, shadowedSeqs: shadowed, shadowedTokenCount },
+        fitRisk,
+        liveAfterTokens: priced.liveAfterTokens,
+        remainingReclaimTokens: remainingReclaim,
+        inflation,
+        overhead,
+      }
     }
-    if (firstSeq === undefined || lastSeq === undefined) return null
-    const view: KernelRangeView = {
-      ranges: [{ startRef: byRaw[String(firstSeq)]!, endRef: byRaw[String(lastSeq)]! }],
-      refs: { byRef: turn.state.messageRefs.byRef },
+    // A fixed request head that already exceeds the window cannot be folded away: every pass
+    // removes SURFACE tokens, never overhead. Continuing would burn up to OVERFLOW_FOLD_PASSES
+    // permanent barriers for a projection that is mathematically unreachable (round-12 review
+    // Q1, both reviewers — the unit fixture used `overhead > window` precisely to force three
+    // passes, which is why the cap lives here and not inside a pass).
+    const overheadBlocksFit = requestOverhead(session) >= window.limit
+    let recovered: OverflowRecoveryResult | null = null
+    for (let pass = 0; pass < OVERFLOW_FOLD_PASSES; pass += 1) {
+      const outcome = foldPass(pass)
+      if (outcome.record === null) break
+      recovered ??= outcome.record
+      if (!outcome.fitRisk) break
+      if (overheadBlocksFit) break
+      // Reachability, not just the fixed head: even folding EVERY row still eligible, the
+      // un-foldable remainder (protected tail, instruction rows, the newest skill catalog, the
+      // active turn, this pass's own marker) times the calibrated inflation plus the overhead
+      // still beats the window — so further passes burn barriers for nothing (round-13 review
+      // Q3c).
+      if ((outcome.liveAfterTokens - outcome.remainingReclaimTokens) * outcome.inflation + outcome.overhead > window.limit) break
     }
-    // `preserveRecent: 5` is region.ts's own default (the nudge range table's
-    // recent-tail protection), pinned EXPLICITLY here: this path acts without
-    // asking the model, so its safety margin must not silently drift with a
-    // tuning change made for the advisory table.
-    const ranges = buildCompressibleSeqRanges(session, view, {
-      preserveRecent: 5,
-      mediaPriceOf: meterMediaPriceResolver(agent, session),
-    })
-    if (ranges.length === 0) return null
-    // Host parity: one useful balanced reduction — the largest eligible
-    // range, priced in the same vocabulary as the nudge range table.
-    const best = ranges.reduce((largest, range) => (range.tokens > largest.tokens ? range : largest))
-    const startRef = byRaw[String(best.start)]
-    const endRef = byRaw[String(best.end)]
-    if (startRef === undefined || endRef === undefined) return null
-    // Engine-written marker: the shared constructor in src/messages.ts is what
-    // makes the projection net exempt it from the model-written frame, so the
-    // model-visible text and the durable/decompress text stay identical.
-    const summary = overflowMarkerSummary(best.count)
-    const applied = this.kernel.applyCompression({
-      ranges: [{ startRef, endRef, summary, topic: 'context-overflow recovery' }],
-      messages: coreMessages,
-      state: turn.state,
-      config,
-    })
-    if (applied.result.blocksCreated === 0) return null
-    this.store.set(session, applied.state)
-    const previousIds = new Set(turn.state.blocks.map((block) => block.blockId))
-    const created = applied.state.blocks.find((block) => !previousIds.has(block.blockId))
-    if (created === undefined) return null
-    const shadowed = shadowedSeqsOf(session, best.start, best.end)
-    if (shadowed.length === 0) return null
-    const shadowedTokenCount = shadowedTokensViaMeter(session, shadowed, agent.ctx)
-    const { provider, model } = routeFor(agent)
-    runCompactionTransaction(session, {
-      start: best.start,
-      end: best.end,
-      shadowedSeqs: shadowed,
-      summary: [{ type: 'text', text: summary }],
-      shadowedTokenCount,
-      provider,
-      model,
-      topic: 'context-overflow recovery',
-      kernelBlockId: created.blockId,
-      directMessageIds: created.directMessageIds,
-      effectiveMessageIds: created.effectiveMessageIds,
-    })
-    return { start: best.start, end: best.end, shadowedSeqs: shadowed, shadowedTokenCount }
+    // The retried request belongs to the FOLDED surface; pairing its billed number with the
+    // pre-fold anchor would read a tokenizer inflation the engine itself caused (round-11 Q4).
+    if (recovered !== null) setCalibrationAnchor(session, surfaceTokens(session))
+    return recovered
   }
 
   /** ACP is model-driven: automatic pressure policy never summarizes by itself. */
