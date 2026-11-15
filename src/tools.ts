@@ -1872,6 +1872,64 @@ async function handleStatus(env: ToolEnvironment, rawArgs: StatusArgs, exec: Too
       )
     }
   }
+    // Provider-anchored billing: an engine append, never a rewrite of the kernel
+    // report (rule 9). The two calibers a compression decision needs: cumulative
+    // uncached vs cache-read, and peak vs total request input. A replace invalidates
+    // the prefix from its rewrite point, so a compress that rewrites early re-reads
+    // the whole remainder on the next request — that is the cost the model cannot
+    // see otherwise.
+    const usage = providerUsage(agent)
+    if (usage !== undefined) {
+      lines.push(
+        '',
+        `Provider usage (cumulative): ${usage.uncachedInputTokens} uncached input | ${usage.cacheReadTokens} cache read | ${usage.cacheWriteTokens} cache write | ${usage.outputTokens} output`,
+      )
+      lines.push('', `Total request input: ${totalRequestInput(usage)}`)
+    }
+    // Live vs peak vs room — the paper’s measurement vocabulary (arXiv 2611.05306
+    // §2.4 separates total length from PEAK length, and names a "compaction
+    // threshold"), made actionable here: a durable replace costs a near-full
+    // re-prefill of whatever stays live, so the model cannot decide whether a
+    // fold pays without knowing the live size and the remaining room. Read from
+    // the log, so it works without a tokenMeter. Rule 9 used to keep window
+    // semantics human-side only; measured fold pricing moved them to the model.
+    const live = lastRequestInput(session)
+    const peak = peakRequestInput(session)
+    const contextLimit = env.windowFor !== undefined ? (await env.windowFor(agent)).limit : env.modelContextLimit
+    const sizeParts: string[] = []
+    if (live > 0) sizeParts.push(`live ${live}`)
+    if (peak > 0) sizeParts.push(`peak ${peak}`)
+    // Every fold leaves a permanent un-foldable summary barrier, so fold count is a
+    // resource the model spends: more barriers means smaller eligible stretches
+    // later, which is how a long session ends up refusing everything (Q5). Cheap
+    // because the ledger is snapshot-cached (rule 14).
+    const folds = rebuildBlockLedger(sessionEventsOf(session)).length
+    if (folds > 0) {
+      // A spent resource: more barriers means smaller eligible stretches later,
+      // which is how a long session ends up refusing everything. No unlock number is
+      // printed here — the round-4 reviews showed a fold count never measured the
+      // debt it claimed (a barrier is a note, not a floor-sized hole), and whether
+      // the engine may fold below the floor is read from the live rows instead.
+      lines.push('', `Fold barriers: ${folds} (each splits the surface and can never be folded again) — fewer, larger folds preserve room for later folds`)
+    }
+    if (contextLimit > 0 && live > 0) sizeParts.push(`window ${contextLimit}`, `room ${Math.max(0, contextLimit - live)}`)
+    if (sizeParts.length > 0) lines.push('', `Request input sizes: ${sizeParts.join(' | ')}`)
+    // The working-set floor is what makes a fold REFUSE, but it was only visible inside a nudge —
+    // and a nudge only fires above the pressure threshold, so on a mid-pressure session the model
+    // sees neither the range table nor the floor and calls `condense` blind (round-15 review Q5).
+    // Printed from the SAME `foldPricingFor` the gate uses, so the number the model reads is the
+    // number the gate applies. The top candidate is deliberately NOT printed: computing it runs
+    // `buildCompressibleSeqRanges`, whose orphan strip APPENDS durable prune events, and this tool
+    // is read-only — a status call must not change the surface it is reporting on.
+    const floorTokens = foldPricingFor({ ...env, modelContextLimit: contextLimit }).floorTokens
+    if (floorTokens !== undefined && floorTokens > 0) {
+      const close = live > 0 && live < floorTokens * 2
+      // The direction matters: a fold leaves EXACTLY the room it does NOT remove, so near the
+      // floor a WIDER span is the one that strands the working set — the same reasoning
+      // `condenseFloorRefusal` carries (round-16 review Q1: this line told the model to widen
+      // into the refusal the guard then produced).
+      lines.push('', `Fold floor: a fold must leave at least ~${floorTokens} live tokens, below which compress and condense both refuse${live > 0 ? ` (live is ${live}${close ? ' — close to the floor: a fold leaves exactly the room it does NOT remove, so the SMALLER span is the one that stays above the floor; better still, stop compressing' : ''})` : ''}`)
+    }
   lines.push('', `Surface: ${surfaceSummary(session)}`)
   // Drilldown rows carry kernel refs (mN, dense log-order ids) — compress
   // accepts them directly (handleCompress reverse-maps mN → live surface seq
