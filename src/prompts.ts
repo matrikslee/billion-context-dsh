@@ -239,8 +239,21 @@ WHEN NOT TO COMPRESS:
 
 {howToCompressRules}
 
+CONDENSE — an engine-elected fold, for a long context with many turns still ahead:
+compress({ condense: { summary } }) elects the LARGEST eligible continuous run of the
+CURRENT surface and folds it in ONE replace — you do not name the span, you write the
+note. Walls the election never crosses: the newest injected instruction copy of every
+scope, the newest skill catalog, checkpoint carriers, the system node, the active user
+turn (superseded injection copies DO fold — they cannot come back). The note is the
+handoff of that stretch and must carry "## Goal" (what the work is and what remains)
+and "## Next" (the immediate next command plus the completion condition); without
+them nothing lands. Price: the next request re-prefills every token AFTER the
+rewrite point ONCE, so WHERE the rewrite lands is the lever — a fold near the tail
+barely re-reads anything, one near the head re-reads almost everything, and three
+small folds pay that re-prefill three times. Prefer the LATEST consumed stretch, fold
+in bulk, and not at all when nothing consumed is worth reclaiming.
 Compression tools (refs are SURFACE SEQS, not ids):
-- compress: replace one or more seq ranges, each with your own dense summary. Single range: compress({ content: [{ startSeq, endSeq, summary }] }). Batch multiple unrelated segments in one call (each entry becomes its own block): compress({ content: [{ startSeq: 1, endSeq: 5, summary: '...' }, { startSeq: 12, endSeq: 18, summary: '...' }] }). Keep ranges disjoint — overlapping entries in one batch are skipped. Edges are auto-balanced to tool-call/result boundaries; a trailing #callId fragment in a seq is ignored. Seq refs must be on the current surface: seqs from older nudges or earlier compresses go stale as the surface moves, so a stale span is auto-remapped to its still-live remainder (the result reports the adjusted span), a fully compressed span is reported as already compressed, and invented/other-session seqs fail with guidance. The block refs (bN, e.g. b1) in acp_status COMPRESSED BLOCKS are for decompress, NOT compress boundaries.
+- compress: replace one or more seq ranges, each with your own dense summary. Single range: compress({ content: [{ startSeq, endSeq, summary }] }). Batch multiple unrelated segments in one call (each entry becomes its own block): compress({ content: [{ startSeq: 1, endSeq: 5, summary: '...' }, { startSeq: 12, endSeq: 18, summary: '...' }] }). Keep ranges disjoint — overlapping entries in one batch are skipped. Edges are auto-balanced to tool-call/result boundaries; a trailing #callId fragment in a seq is ignored. Seq refs must be on the current surface: seqs from older nudges or earlier compresses go stale as the surface moves, so a stale span is auto-remapped to its still-live remainder (the result reports the adjusted span), a fully compressed span is reported as already compressed, and invented/other-session seqs fail with guidance. The block refs (bN, e.g. b1) in acp_status COMPRESSED BLOCKS are compress boundaries too — naming one folds the checkpoint node of that block, which is what makes the fold a tier 2/3 distillation; decompress accepts the same ref.
 - decompress: recover a compressed block's original content, read-only. decompress({ blockId }) — accept the bN ref shown by acp_status (e.g. b1) or a compaction id. Large blocks page (each page sized to stay under the host tool-result trim budget, up to 100 messages): pass offset/limit and follow the continue hint in the result.
 - search_context: when a summary lacks the details you need (exact values, error strings, decisions, verbatim code), SEARCH the compressed blocks FIRST — never guess or reconstruct from memory; search_context(query) locates the right block, decompress only that block.
 - acp_status: current context usage and the live compressible-range list. Run it right before compressing — the only seqs that never go stale are the ones you just read. Drilldown (scope/view/tool/sort/limit) lists per-message or per-block sizes; drilldown rows are kernel ids (mN) — compress accepts them directly (auto-mapped to the live surface seq).

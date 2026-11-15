@@ -15,17 +15,20 @@ import { buildStatusReport, defaultCountTokens, searchBlocks, type CompressionCo
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { AcpStateStore } from './state.ts'
-import { kernelConfigFor, type KernelConfigInput } from './config.ts'
+import { foldPricingFor, kernelConfigFor, MIN_DEGRADED_FOLD_TOKENS, type KernelConfigInput } from './config.ts'
 import { resolveTokenCount } from './nudge.ts'
 import { routeFor, type AcpWindow } from './window.ts'
 import {
   AlreadyCompressedRangeError,
+  buildCompressibleSeqRanges,
   blockIdOfKernelRef,
   blockRefForSummarySeq,
   blockRegistry,
   compactionIdsOfKernelBlocks,
   expandShadowedSeqs,
   guardedSurfaceSeqsOf,
+  type KernelRangeView,
+  type SeqCompressibleRange,
   isExactSurfaceSpan,
   rebuildBlockLedger,
   resolveSurfaceRange,
@@ -39,10 +42,14 @@ import {
   surfaceSummary,
   DEFAULT_DECOMPRESS_PAGE,
   DEFAULT_DECOMPRESS_PAGE_CHARS,
+  foldSpanPricing,
+  surfaceTokens,
+  type FoldPricing,
   type ResolvedSurfaceRange,
 } from './region.ts'
-import { allLogMessages, attachmentsOfEvent, buildToolCallIndex, eventsToCoreMessages, extractEventText, isAgentInstructionsRow, isCheckpointNode, isRealUserTurn, isSkillCatalogRow, surfaceEventsOf, toolCallsOf } from './messages.ts'
+import { allLogMessages, attachmentsOfEvent, buildToolCallIndex, eventsToCoreMessages, extractEventText, isAgentInstructionsRow, isCheckpointNode, isRealUserTurn, isSkillCatalogRow, surfaceEventsOf, toolCallsOf, withSummaryFramePrefix } from './messages.ts'
 import { shadowedTokensViaMeter } from './host-tokens.ts'
+import { DEFAULT_OVERFLOW_INFLATION, lastRequestInput, pairedInflation, peakRequestInput, providerUsage, recordCompressCost, requestOverhead, totalRequestInput } from './usage.ts'
 import { eventAtOf, sessionEventsOf } from './session-events.ts'
 import { DEFAULT_RESOLVED, type ResolvedPrompts } from './prompts.ts'
 import { callHint, type ResolvedCallStyle } from './ptc.ts'
@@ -180,6 +187,21 @@ export const compressParameters = {
       additionalProperties: false,
     },
   },
+  force: {
+    type: 'boolean' as const,
+    description: 'Override the working-set floor guard on BOTH paths — an explicit content range whose fold leaves less than foldFloorPct of the window visible, and a condense election. Legitimate only for imminent overflow: a shallow working set is where open-weight accuracy collapses (arXiv 2611.05306 Appendix D).',
+  },
+  condense: {
+    type: 'object' as const,
+    description: 'Engine-picked fold: the engine elects the LARGEST eligible continuous run of the CURRENT surface (walls: the newest injected instruction copy of every scope, the newest skill catalog, checkpoint carriers, the system node, the active user turn) and folds it in ONE durable replace — you write the handoff note. Mutually exclusive with content. The note must carry "## Goal" (what the stretch was doing and what remains) and "## Next" (the immediate next command plus the completion condition): a note without them turns one fold into a re-run of the work it replaced. Price: the next request re-prefills every token AFTER the rewrite point ONCE, so the rewrite point IS the lever — a fold near the tail barely re-reads anything, one near the head re-reads almost everything. Prefer the LATEST consumed stretch, fold in bulk, and do not fold at all when nothing consumed is worth reclaiming.',
+    properties: {
+      summary: { type: 'string' as const, required: true, description: 'The handoff note replacing the elected stretch. Minimum 50 characters; must carry ## Goal and ## Next. Best shape (arXiv 2611.05306 Appendix G): ## Goal, ## Established facts, ## Applied changes, ## Verification (what you ran, what passed, what failed and the workaround), ## Dead ends (tried and why they failed — so nobody retries them), ## Remaining plan with the immediate next command AND the completion condition, carried verbatim. Only Goal/Next are enforced; the rest is checked and named as a warning.' },
+      topic: { type: 'string' as const, description: 'Short label (3-5 words) for the folded block.' },
+      force: { type: 'boolean' as const, description: 'Fold even though it leaves less than the working-set floor visible (foldFloorPct of the window). Only for imminent overflow: a shallow working set is where open-weight models lose accuracy.' },
+      verifiedReadings: { type: 'array' as const, items: { type: 'string' as const }, description: 'Optional: acceptance readings already green before this fold (e.g. "t0-fastpath 8/8").' },
+    },
+    additionalProperties: false,
+  },
 } as const
 
 /** Normalize a seq arg: number, "295", or "295#call_00_xxx" → 295. */
@@ -279,6 +301,9 @@ interface CompressArgs {
   arguments?: string | { content?: CompressArgs['content'] }
   topic?: string
   content?: Array<{ startSeq: number | string; endSeq: number | string; summary: string; topic?: string; verifiedReadings?: string[] }>
+  /** Engine-picked fold: the engine names the span, the model writes the handoff note. */
+  force?: boolean
+  condense?: { summary: string; topic?: string; verifiedReadings?: string[]; force?: boolean }
 }
 
 /**
@@ -288,7 +313,7 @@ interface CompressArgs {
  * untouched. Returns null when no form carries content (caller raises).
  */
 function unwrapCompressArgs(args: CompressArgs): CompressArgs | null {
-  if (args.content !== undefined) return args
+  if (args.content !== undefined || args.condense !== undefined) return args
   if (args.arguments === undefined) return null
   let inner: unknown = args.arguments
   if (typeof inner === 'string') {
@@ -299,9 +324,13 @@ function unwrapCompressArgs(args: CompressArgs): CompressArgs | null {
     }
   }
   if (typeof inner !== 'object' || inner === null || Array.isArray(inner)) return null
-  const content = (inner as { content?: unknown }).content
-  if (content === undefined) return null
-  return { ...args, content: content as CompressArgs['content'] }
+  const inner2 = inner as { content?: unknown; condense?: unknown }
+  if (inner2.content === undefined && inner2.condense === undefined) return null
+  return {
+    ...args,
+    content: inner2.content as CompressArgs['content'],
+    condense: inner2.condense as CompressArgs['condense'],
+  }
 }
 
 /**
@@ -561,6 +590,471 @@ function anchorRefForNode(
   return undefined
 }
 
+/** One continuous run a condense may fold, priced with the fold-cost column. */
+export interface CondensePick {
+  readonly start: number
+  readonly end: number
+  readonly count: number
+  readonly tokens: number
+  readonly foldCostTokens: number
+  /** Tokens that stay visible after this fold. */
+  readonly liveAfterFoldTokens: number
+  /** The elected run would leave less than the working-set floor visible. */
+  readonly belowFloor: boolean
+  /**
+   * Whether ANY eligible run (not just the elected one) clears the floor. A
+   * refusal telling the model to fold WIDER when nothing wider is eligible is a
+   * loop generator: every larger span is guarded, so the model gets the
+   * guarded-row refusal back with no third move (cross-review Q3).
+   */
+  readonly aboveFloorAvailable: boolean
+  /**
+   * True when the PAYBACK gate stepped aside because the session is already close to
+   * the window: refusing a fold there does not save the session — the provider rejects
+   * the next request outright, and a costly fold beats a hard failure.
+   */
+  readonly pressureRelief: boolean
+  /**
+   * The window limit behind `pressureRelief` (0 when no pressure was supplied). The write-time
+   * gate needs it: relief must buy REAL headroom, and what counts as real is window-relative
+   * (round-13 review Q2 — `netSaving > 0` let a 1-token reclaim spend a permanent barrier and a
+   * full re-prefill at ≥85% of the window).
+   */
+  readonly reliefLimitTokens: number
+  /**
+   * The largest note (stored form, frame prefix included) that still pays back inside
+   * `CONDENSE_PAYBACK_REQUESTS` for the elected span; `Infinity` under pressure relief, where the
+   * horizon stepped aside. The write-time refusal quotes it so a model that over-wrote its note
+   * shortens it to a number that works instead of guessing (round-14 review Q2).
+   */
+  readonly noteBudgetTokens: number
+  /**
+   * How many surface rows the guards refuse (current instruction copies, the
+   * newest skill catalog, checkpoint carriers, the active user turn). A session
+   * that is wide but walled is NOT stuck: telling it to fold wider sends it into
+   * the guard, and telling it to stop compressing hides the fact that the
+   * walls shrink on their own as the session continues (cross-review Q4).
+   */
+  readonly guardedRowCount: number
+  /** How many eligible ranges the geometry produced at all (0 = nothing clears the kernel minimum). */
+  readonly eligibleRangeCount: number
+  /**
+   * Set on the synthesized content item of a DEGRADED election. The explicit-range
+   * floor guard reads it instead of a mutable flag, so the two guards share one
+   * decision (cross-review Q2: an ambient bypass is how the elected fold got
+   * re-refused by its own guard).
+   */
+  readonly degraded: boolean
+}
+
+export interface CondenseMiss {
+  readonly reason: string
+  readonly candidates: SeqCompressibleRange[]
+}
+
+/**
+ * The largest CONTINUOUS eligible run of the current surface, for condense.
+ *
+ * Geometry is the range table’s own (buildCompressibleSeqRanges, rule 3), so a
+ * condense can never shadow a row the durable surface forbids: the CURRENT
+ * injected copy of every scope, the newest visible skill catalog, checkpoint
+ * carriers, the system node and the active user turn are the walls. Superseded
+ * injection copies are NOT walls (foldStaleInstructionRows) — the host re-sends a
+ * group’s newest row only, so an older AGENTS.md or catalog row folded away stays
+ * gone, and that residue is most of what a long session carries.
+ *
+ * Ranked by NET saving (`tokens − foldCostTokens`), not by volume. Volume was the
+ * old rule and it is backwards on a durable surface: compression summary nodes are
+ * appended AFTER the rows they replace, so nearly every older row sits in front of a
+ * large resident summary block and re-prefills it. Measured 2026-11-15: the volume
+ * election removed 23,588 tokens and the very next request re-prefilled 155,927 —
+ * about 65 seconds on this engine for a 23.6K-per-request saving.
+ *
+ * The saving IS recurring while the re-prefill is paid ONCE, so a slow payback is still a
+ * payback: a row with `foldCost >= tokens` is NOT hard-refused (round-10 review B2), it is an
+ * investment that turns positive after foldCost / (tokens − note) further requests. The engine
+ * cannot know how many requests are left, so the election REFUSES only when
+ * `foldCost > tokens * CONDENSE_PAYBACK_REQUESTS` — beyond the horizon — printing that
+ * break-even count and leaving the call to the model through an explicit `content`
+ * range (rule 3: the engine never folds by itself). The one genuinely unrecoverable case,
+ * `note >= tokens`, is refused at write time by condenseNotePayback below.
+ */
+export function pickCondenseSpan(
+  session: Session,
+  turn: ReturnType<CompressionCore['processTurn']>,
+  preserveRecent: number,
+  foldPricing?: FoldPricing,
+  /** live billed input and window limit, for the pressure-relief bypass. */
+  pressure?: { readonly liveTokens: number; readonly limitTokens: number },
+): CondensePick | CondenseMiss {
+  const byRaw = turn.state.messageRefs.byRaw
+  const nodes = session.surface.nodes
+  let firstSeq: number | undefined
+  let lastSeq: number | undefined
+  let refCount = 0
+  for (const seq of nodes) {
+    if (byRaw[String(seq)] === undefined) continue
+    refCount += 1
+    firstSeq ??= seq
+    lastSeq = seq
+  }
+  if (firstSeq === undefined || lastSeq === undefined) {
+    return {
+      reason: 'the kernel holds no ref for any of the ' + nodes.length + ' live surface nodes \u2014 nothing has been projected yet',
+      candidates: [],
+    }
+  }
+  const view: KernelRangeView = {
+    ranges: [{ startRef: byRaw[String(firstSeq)]!, endRef: byRaw[String(lastSeq)]! }],
+    refs: { byRef: turn.state.messageRefs.byRef },
+  }
+  const ranges = buildCompressibleSeqRanges(session, view, {
+    preserveRecent,
+    foldStaleInstructionRows: true,
+    ...(foldPricing === undefined ? {} : { foldPricing }),
+  })
+  let best: SeqCompressibleRange | undefined
+  let bestNet = Number.NEGATIVE_INFINITY
+  for (const range of ranges) {
+    const net = range.tokens - range.foldCostTokens
+    // Equal net, unequal safety: a run whose tool output the host already wrote to a FILE costs
+    // nothing to re-read after the fold, so it wins the tie (round-15 review Q4).
+    if (net > bestNet || (net === bestNet && best !== undefined && range.spills > best.spills)) {
+      bestNet = net
+      best = range
+    }
+  }
+  if (best === undefined) {
+    return {
+      reason: 'no continuous run clears the kernel minimum range (counted in CHARACTERS, compress.minCompressRange) \u2014 ' + refCount + ' projected nodes, nothing contiguous enough to fold',
+      candidates: ranges.slice(0, 6),
+    }
+  }
+  // A fold pays its re-prefill ONCE and saves `span − note` on EVERY later request, so the
+  // honest gate is a payback horizon computed WITH the note. The engine cannot know how many
+  // requests this session still has, so it assumes the session keeps running for
+  // CONDENSE_PAYBACK_REQUESTS more of them and refuses below that; the refusal prints the
+  // real payback count so the model can override with an explicit content range.
+  const relief =
+    pressure !== undefined &&
+    pressure.limitTokens > 0 &&
+    pressure.liveTokens >= pressure.limitTokens * CONDENSE_PRESSURE_RELIEF_RATIO
+  // A span this small CANNOT carry a handoff: the 35% weight cap allows ~420 note tokens at
+  // the floor and less below it, which is not a briefing — electing it spends a turn on a note
+  // the write-time gate would reject anyway (round-13 review Q5: a 750-token span was elected,
+  // the model wrote a note, and the note gate refused it, burning a turn and a re-prefill).
+  if (best.tokens < MIN_CONDENSE_SPAN_TOKENS) {
+    return {
+      reason: 'the largest eligible run is ~' + best.tokens + ' tokens, under the ' + MIN_CONDENSE_SPAN_TOKENS
+        + '-token floor for a condense handoff: a note that fits the ' + Math.round(MAX_NOTE_WEIGHT_RATIO * 100)
+        + '% weight cap on a span this small is a second copy, not a briefing. Keep working so consumed stretches accumulate, or send that span as an explicit content range with a one-line summary — that path carries no handoff requirement',
+      candidates: ranges.slice(0, 6),
+    }
+  }
+  // The election side cannot see the note yet, so it solves for the LARGEST note that can still
+  // pay back inside the horizon instead of assuming the worst the weight cap allows:
+  // `foldCost + note <= N × (tokens − note)`  ⇒  `note <= (N × tokens − foldCost) / (N + 1)`.
+  // Pricing the worst-case 35% note here refused spans a real handoff pays back (round-14 review
+  // Q2: a 40K span against a 96K re-prefill breaks even in 3 requests with an ~85-token note, yet
+  // the worst-case price read 5 and refused the election BEFORE the model could write anything).
+  // Nothing lands unchecked: the write-time gate still enforces the 35% weight cap and re-prices
+  // the payback against the REAL note (`condenseNotePayback`).
+  const noteBudget = condenseNoteBudget(best.tokens, best.foldCostTokens)
+  if (!relief && noteBudget < MIN_HANDOFF_NOTE_TOKENS) {
+    return {
+      reason: [
+        'every eligible row costs MORE to re-prefill (once) than it removes: the best row removes ' +
+          best.tokens + ' tokens and re-prefills ~' + best.foldCostTokens + ' after its rewrite point',
+        '(one-time net ' + bestNet + '). A handoff note has to be at least ~' + MIN_HANDOFF_NOTE_TOKENS +
+          ' tokens to brief a resumed session, and this row allows a note of only ~' +
+          Math.max(0, noteBudget) + ' stored tokens (frame prefix included) inside the ' +
+          CONDENSE_PAYBACK_REQUESTS + '-request horizon' +
+          (noteBudget <= 0 ? ' — what it removes never earns the re-prefill back at ANY note size' : '') +
+          '. Send that span as an explicit content range.',
+        'Otherwise stop compressing and keep working: a fold that removes little right in front of a',
+        'big resident summary is a loss. The payback gate steps aside only at ≥'
+        + Math.round(CONDENSE_PRESSURE_RELIEF_RATIO * 100) + '% of the window (pressure relief, and',
+        'even there only for a fold that reclaims real headroom); the working-set floor and the',
+        'note-weight gate never step aside.',
+      ].join(' '),
+      candidates: ranges.slice(0, 6),
+    }
+  }
+  // Relief exists to buy off a provider rejection, so it must buy REAL headroom even with the
+  // smallest note this tool accepts. A span that cannot reach `reliefFloor` with a bare note is
+  // refused HERE, not after the model spends a turn writing one (round-14 review Q3: the election
+  // still offered 2000..4096-token rows on a 262K window that `handleCompress` then refused
+  // unconditionally).
+  const reliefFloor = reliefMinSavingTokens(relief, pressure?.limitTokens ?? 0)
+  if (relief && !reliefSpanReachable(best.tokens, pressure?.limitTokens ?? 0)) {
+    return {
+      reason: [
+        'pressure relief demands a real reclaim: the best row removes only ' + best.tokens +
+          ' tokens, and even with the smallest note this tool accepts (~' + SUMMARY_FRAME_TOKENS +
+          ' tokens of summary frame prefix) that leaves under ~' + reliefFloor + ' tokens of headroom',
+        '(2% of the ~' + (pressure?.limitTokens ?? 0) + '-token window). A fold that saves less spends a',
+        'permanent barrier and a full re-prefill and re-arms the same cliff one step later. Fold a',
+        'bigger stretch — the nudge range table and acp_status list the eligible rows.',
+      ].join(' '),
+      candidates: ranges.slice(0, 6),
+    }
+  }
+  return {
+    start: best.start,
+    end: best.end,
+    count: best.count,
+    tokens: best.tokens,
+    foldCostTokens: best.foldCostTokens,
+    liveAfterFoldTokens: best.liveAfterFoldTokens,
+    belowFloor: best.belowFloor,
+    aboveFloorAvailable: ranges.some((range) => !range.belowFloor),
+    guardedRowCount: guardedSurfaceSeqsOf(session).size,
+    eligibleRangeCount: ranges.length,
+    degraded: false,
+    pressureRelief: relief,
+    reliefLimitTokens: pressure?.limitTokens ?? 0,
+    noteBudgetTokens: relief ? Number.POSITIVE_INFINITY : noteBudget,
+  }
+}
+
+/**
+ * Whether a below-floor condense may still fold. The ONLY compliant reason is
+ * that NO eligible row could keep the floor: while one exists, condense must fold
+ * that row instead — degrading when a compliant row is available throws away the
+ * working set for nothing (round-4 Q1: the barrier-count gate could fire while a
+ * 20K row above the floor was still sitting there eligible).
+ *
+ * The barrier COUNT is not the gate, because it never measured what it claimed:
+ * a fold leaves a summary node (a few hundred tokens of note), not a floor-sized
+ * hole, so `n folds × floor` is not a debt the window carries. Fragmentation is
+ * observable directly in the row set, which needs no new measurement.
+ */
+export function condenseDegradable(pick: CondensePick, minimum: number): boolean {
+  return pick.belowFloor && !pick.aboveFloorAvailable && pick.tokens >= minimum
+}
+
+/**
+ * Refusal copy for a below-floor condense. The THREE branches ARE the point
+ * (cross-review Q4): two-branch copy conflated "nothing wider is above the floor"
+ * with "nothing is eligible at all", so a session whose reclaimable area is merely
+ * FRAGMENTED by the guards was told to stop compressing — and a session with
+ * nothing to fold was told to widen into a guard. Both are loops. Exported so
+ * every branch is testable without building three fixtures.
+ */
+export function condenseFloorRefusal(pick: CondensePick, floor: number): string {
+  const head = `compress: condense refused seqs ${pick.start}..${pick.end} — it removes ~${pick.tokens} tokens and leaves only ~${pick.liveAfterFoldTokens}, under the working-set floor ~${floor}.\n`
+
+  if (pick.aboveFloorAvailable) {
+    return head + `AN ELIGIBLE ROW STILL LEAVES THE FLOOR: fold THAT row instead. A fold leaves exactly as much room as it does NOT remove, so the widest row is the one that strands the working set. Batch only spans you would fold anyway: a batch pays ONE re-prefill measured from its EARLIEST rewrite point, so folding an early row together with a later one pays the early row's whole suffix (see the foldCost column). Pass force:true only when you accept a shallow working set (e.g. an imminent overflow).`
+  }
+  if (pick.eligibleRangeCount > 0) {
+    return head + `NO ELIGIBLE ROW LEAVES THE FLOOR: ${pick.eligibleRangeCount} row(s) remain and every one of them ends under ~${floor} tokens, while ${pick.guardedRowCount} row(s) are refused by the guards (current instruction copies, the newest skill catalog, the active user turn). Do NOT widen blindly — no call can reclaim a guarded row. The engine folds below the floor on its own only when nothing else can keep it, and that is decided from these rows, not from a fold count. Fold nothing for now, or name ONE explicit range with force:true if an overflow is imminent.`
+  }
+  return head + `NOTHING ELSE IS ELIGIBLE AT ALL: no range clears the kernel minimum, so there is no fold to make here. Do NOT retry — stop compressing and keep working.`
+}
+
+/**
+ * A condense note replaces a stretch the model never named, so it must carry the
+ * handoff the model would have written by hand: what the work IS, and what runs
+ * next. A note missing either heading turns one fold into a re-run of consumed
+ * exploration, which costs more than the fold saved.
+ */
+// Tolerant on purpose: `## Goal`, `# Goal`, `**Goal**`, `Goal:` and the Chinese
+// spellings all pass. A gate that rejects a formatting variant is a production
+// break on a model whose note is otherwise correct (cross-review Q1).
+const CONDENSE_GOAL = /(^|\n)\s*(?:#{1,4}|\*{1,3})?\s*[{[【]?\s*(goal|objective|\u4efb\u52a1|\u76ee\u6807)\s*[}\]】]?\s*[:：]?/i
+const CONDENSE_NEXT = /(^|\n)\s*(?:#{1,4}|\*{1,3})?\s*[{[【]?\s*(next|next step|remaining plan|\u4e0b\u4e00\u6b65|\u5b8c\u6210\u6761\u4ef6|\u5269\u4f59\u8ba1\u5212)\s*[}\]】]?\s*[:：]?/i
+
+export function missingCondenseHeadings(note: string): string[] {
+  const missing: string[] = []
+  if (!CONDENSE_GOAL.test(note)) missing.push('## Goal \u2014 what this stretch was doing and what remains')
+  if (!CONDENSE_NEXT.test(note)) missing.push('## Next \u2014 the immediate next command and the completion condition')
+  return missing
+}
+
+/**
+ * The six fields of arXiv 2611.05306 Appendix G — the shape whose absence makes
+ * a resumed session re-derive work it already did. ADVISORY, never a gate: a
+ * hard six-heading gate costs resident prompt text plus a retry loop, and on an
+ * open-weight model that trade measured worse than the missing fields (both
+ * cross-reviews rejected the hard gate). Only Goal and Next are enforced above;
+ * a note missing the rest folds with a one-line warning.
+ */
+const CONDENSE_FIELDS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/^\s*#{1,3}\s*(objective|goal|\u4efb\u52a1|\u76ee\u6807)/im, 'Objective'],
+  [/^\s*#{1,3}\s*(established facts|facts|\u5df2\u786e\u8ba4\u4e8b\u5b9e|\u4e8b\u5b9e)/im, 'Established facts'],
+  [/^\s*#{1,3}\s*(applied changes|changes|\u5df2\u505a\u6539\u52a8|\u6539\u52a8)/im, 'Applied changes'],
+  [/^\s*#{1,3}\s*(verification|verified|\u9a8c\u8bc1|\u5df2\u9a8c\u8bc1)/im, 'Verification'],
+  [/^\s*#{1,3}\s*(dead ends|failed|\u6b7b\u8def|\u5931\u8d25\u5c1d\u8bd5)/im, 'Dead ends'],
+  [/^\s*#{1,3}\s*(remaining plan|next|next step|\u8ba1\u5212|\u4e0b\u4e00\u6b65|\u5b8c\u6210\u6761\u4ef6)/im, 'Remaining plan'],
+]
+
+export function condenseNoteGaps(note: string): string[] {
+  return CONDENSE_FIELDS.filter(([pattern]) => !pattern.test(note)).map(([, name]) => name)
+}
+
+/**
+ * Does the note actually COMPRESS? Three cross-reviews killed the earlier
+ * post-fold duplication warning: it fires AFTER the fold lands, so obeying it
+ * means rewriting the note and paying a second full re-prefill — costlier to act
+ * on than to ignore — and lexical shingles flag exactly the verbatim identifiers,
+ * paths and error strings a good note SHOULD carry.
+ *
+ * The replacement is deterministic, pre-fold and language-independent: compare
+ * the note’s weight against the stretch it replaces. A note weighing a third of
+ * the folded span is not a briefing, it is a second copy that stays resident in
+ * every later request — the fold never earns its one-time re-prefill back.
+ */
+export const MAX_NOTE_WEIGHT_RATIO = 0.35
+
+/**
+ * What the summary frame prefix costs on its own. The stored note is ALWAYS
+ * `withSummaryFramePrefix(note)` (region.ts writes it, messages.ts projects it), so every
+ * weight and payback number must include it — a bare note count under-priced the resident
+ * node (round-12 Q3 caveat) and made the weight gate disagree with the payback gate
+ * (round-13 Q1). Derived from the prefix itself, not hardcoded, so a copy change follows it.
+ */
+const SUMMARY_FRAME_TOKENS = defaultCountTokens(withSummaryFramePrefix('x')) - defaultCountTokens('x')
+
+/**
+ * What a handoff note actually weighs on this host, measured 2026-11-15: a real model-written
+ * `condense` note stored ~915 tokens while missing FOUR of the six Appendix-G fields. That is the
+ * number the span floor has to clear, not a guess: a floor derived from a note the model will
+ * never write lets a span into the election the weight gate then refuses (round-15 review Q7.1:
+ * at `MAX_NOTE_WEIGHT_RATIO` a 2000-token span admits only ~700 stored tokens, so every span
+ * between 2000 and ~2614 tokens was elected, paid for by a turn of writing, and then refused).
+ */
+export const TYPICAL_HANDOFF_NOTE_TOKENS = 900
+
+/**
+ * Smallest stretch condense will elect: the smallest span that can carry a note this host's
+ * models actually write inside the weight cap — `TYPICAL_HANDOFF_NOTE_TOKENS / MAX_NOTE_WEIGHT_RATIO`,
+ * so a copy or ratio change follows it instead of drifting. The kernel minimum (`minCompressRange`)
+ * is a CHARACTER threshold (5000 chars ≈ 1250 tokens), which filters nothing; the real floor is
+ * the note's weight (round-13 review Q5: a 750-token election, then the weight gate).
+ */
+export const MIN_CONDENSE_SPAN_TOKENS = Math.ceil(TYPICAL_HANDOFF_NOTE_TOKENS / MAX_NOTE_WEIGHT_RATIO)
+
+/**
+ * The smallest handoff note (stored form, frame prefix included) that can still brief a resumed
+ * session: the Appendix-G headings plus one line each. The election uses it as the floor of the
+ * NOTE BUDGET it solves for, so a span that cannot carry a real briefing inside the payback
+ * horizon is refused before the model writes anything (round-14 review Q2/Q5).
+ */
+export const MIN_HANDOFF_NOTE_TOKENS = 250
+
+/**
+ * How much net headroom a relief fold must buy, as a fraction of the window. Relief exists to
+ * avoid a provider rejection, so a fold that reclaims a few hundred tokens while spending a
+ * permanent barrier and a full re-prefill does not relieve anything — it just re-arms the same
+ * cliff one step later (round-13 review Q2: cliff thrashing). Window-relative for the same
+ * reason the emergency minimum is: a hard constant silently disables relief on a small window.
+ */
+export const RELIEF_MIN_NET_SAVING_RATIO = 0.02
+
+/**
+ * The net reclaim relief still demands (0 outside relief). Exported so the arithmetic is
+ * testable without engineering a session whose pressure, suffix and note all line up.
+ */
+/**
+ * Cap on the relief floor, deliberately NOT `MIN_DEGRADED_FOLD_TOKENS`. That constant is a GROSS
+ * span-size floor (`pick.tokens >= minimum`), while `reliefMinSavingTokens` gates a NET reclaim
+ * (`span − note`); sharing one value meant a net-reclaim floor of 4096 forced a ~6.3K-token span
+ * whenever the model wrote a 35% note, and any change to one silently moved the other
+ * (round-14 review Q3).
+ */
+export const RELIEF_MIN_NET_SAVING_MAX_TOKENS = 2048
+
+export function reliefMinSavingTokens(pressureRelief: boolean, limitTokens: number): number {
+  if (!pressureRelief || limitTokens <= 0) return 0
+  return Math.min(RELIEF_MIN_NET_SAVING_MAX_TOKENS, Math.max(1, Math.floor(limitTokens * RELIEF_MIN_NET_SAVING_RATIO)))
+}
+
+/** How many further requests a condense must pay back inside to be worth electing. */
+export const CONDENSE_PAYBACK_REQUESTS = 4
+
+/**
+ * The largest note (stored form, frame prefix included) that still pays back inside the horizon:
+ * `foldCost + note <= N × (tokens − note)`  ⇒  `note <= (N × tokens − foldCost) / (N + 1)`.
+ * Exported so the arithmetic is testable without engineering a fixture whose span, suffix and
+ * note all line up (round-14 review Q2 replaced the worst-case-note price with this).
+ */
+export function condenseNoteBudget(spanTokens: number, foldCostTokens: number): number {
+  return Math.floor((CONDENSE_PAYBACK_REQUESTS * spanTokens - foldCostTokens) / (CONDENSE_PAYBACK_REQUESTS + 1))
+}
+
+/**
+ * Whether a relief span can reach the relief floor at all — with the smallest note this tool
+ * accepts (the bare summary frame prefix). Exported for the same reason (round-14 review Q3).
+ */
+export function reliefSpanReachable(spanTokens: number, limitTokens: number): boolean {
+  return spanTokens - SUMMARY_FRAME_TOKENS >= reliefMinSavingTokens(true, limitTokens)
+}
+
+/**
+ * Pressure at which the payback gate steps aside (live billed input ÷ window).
+ * Below it a poor-payback fold is a choice; at or above it, NOT folding is the
+ * riskier option because the next request can be rejected by the provider.
+ */
+export const CONDENSE_PRESSURE_RELIEF_RATIO = 0.85
+
+/**
+ * Is this condense worth running once the note is counted? The folded volume is the saving
+ * side, but the note stays resident on EVERY later request, so the honest saving is
+ * `span − note`, and the one-time cost is the re-prefill. Exported so the arithmetic is
+ * testable without engineering a fixture whose stretch, suffix and note all line up.
+ */
+export function condenseNotePayback(spanTokens: number, foldCostTokens: number, noteTokens: number):
+  { readonly worth: boolean; readonly payback: number; readonly netSaving: number } {
+  const netSaving = spanTokens - noteTokens
+  // A note as big as the stretch it replaces is a second copy, not a briefing: nothing is
+  // ever saved, so the fold can NEVER pay back — and that must not hinge on how cheap the
+  // re-prefill happens to be. The earlier Math.max(1, netSaving) turned "no saving" into
+  // "1 token per request", which made a tail fold (foldCost 0..4) look worth doing (round-11 Q7).
+  if (netSaving <= 0) return { worth: false, payback: Number.POSITIVE_INFINITY, netSaving }
+  // The note itself also sits AT the rewrite point, so it is not inside the suffix price
+  // (surfaceSuffixTokens[endIndex + 1] starts AFTER the END edge) and the next request
+  // prefills it uncached once (round-11 Q1).
+  const cost = foldCostTokens + noteTokens
+  return { worth: cost <= netSaving * CONDENSE_PAYBACK_REQUESTS, payback: Math.ceil(cost / netSaving), netSaving }
+}
+
+/**
+ * Note weight, priced as the note is STORED. Two gates read this number — the weight cap here
+ * and the payback re-pricing in `handleCompress` — and they must not disagree: measuring the
+ * raw note here while pricing the stored node there let a note just under 35% raw exceed 35%
+ * once the frame prefix (and the degrade stamp) landed (round-13 review Q1).
+ * `storedTokens` lets a caller that already counted the stored form pass it in.
+ */
+export function noteWeightRatio(note: string, spanTokens: number, storedTokens?: number): number {
+  // A zero-priced span cannot carry ANY note — returning 0 here read as "weightless" and
+  // admitted a note onto a span with nothing to save (round-11 Q7).
+  if (spanTokens <= 0) return Number.POSITIVE_INFINITY
+  return (storedTokens ?? defaultCountTokens(withSummaryFramePrefix(note))) / spanTokens
+}
+
+export function noteWeightRejection(
+  note: string,
+  spanTokens: number,
+  storedTokens?: number,
+  includesDegradeLine = false,
+): string {
+  const tokens = storedTokens ?? defaultCountTokens(withSummaryFramePrefix(note))
+  const ratio = noteWeightRatio(note, spanTokens, tokens)
+  if (!Number.isFinite(ratio)) {
+    return (
+      'compress: condense refused — the elected span holds ~0 tokens, so a note of any size can only ADD resident text.\n'
+        + 'Nothing lands. Fold a stretch that actually carries consumed work (see the nudge range table or acp_status), or skip the fold.'
+    )
+  }
+  return (
+    'compress: condense refused — your note is ~' + Math.round(ratio * 100) + '% of the ' + spanTokens + ' tokens it replaces (limit ' + Math.round(MAX_NOTE_WEIGHT_RATIO * 100) + '%), counted as it is stored (' + tokens + ' tokens including the summary frame prefix'
+      + (includesDegradeLine ? ' and the [dsh:degraded] line' : '') + ').\n'
+      + 'That is a second copy, not a briefing: it stays resident in every later request, so the fold never pays back its one-time re-prefill.\n'
+      + 'Cut it to what a resumed session cannot re-derive: ## Goal, Established facts, Applied changes, Verification, Dead ends, Remaining plan (next command + completion condition). Nothing lands — rewrite the note and send it again.'
+  )
+}
+
 async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: ToolRunContext): Promise<TextOutput> {
   const agent = requireAgent(exec)
   const session = agent.session
@@ -603,6 +1097,127 @@ async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: To
     }
   }
   args = unwrapped
+  // condense: the engine names the span, the model writes the handoff note. From
+  // here on the write is IDENTICAL to an explicit range — guarded rows, live
+  // checkpoint carriers, pairing balance and the provenance gate all still apply,
+  // because the engine picks from the range table geometry the guards produced.
+  let condensePick: CondensePick | undefined
+  if (args.condense !== undefined) {
+    if (args.content !== undefined) {
+      return { text: 'compress: condense and content are mutually exclusive — pass one or the other' }
+    }
+    const note = args.condense.summary ?? ''
+    const missing = missingCondenseHeadings(note)
+    if (missing.length > 0) {
+      return {
+        text: 'compress: condense needs a handoff note, not a topical summary — add ' + missing.join(' and ') + '.\n'
+          + 'Re-send the SAME condense call with the completed note: the engine re-picks the span from the CURRENT surface, so nothing you wrote is invalidated.',
+      }
+    }
+    // Pressure decides whether the payback gate may step aside (round-10 review B2).
+    // lastRequestInput is a LAGGING quantity (round-11 Q6): it carries none of that request's
+    // own output and none of the rows that landed since it, so a session that crossed the cliff
+    // AFTER the last billed request would still enforce the gate — and the very next request is
+    // then rejected by the provider. Project the CURRENT surface with the same calibrated factors
+    // the emergency projection uses and take the larger side.
+    const liveTokens = Math.max(
+      lastRequestInput(session),
+      surfaceTokens(session) * (pairedInflation(session) ?? DEFAULT_OVERFLOW_INFLATION) + requestOverhead(session),
+    )
+    const pick = pickCondenseSpan(session, turn, 5, foldPricingFor(env), {
+      liveTokens,
+      limitTokens: window.limit,
+    })
+    if ('reason' in pick) {
+      const rows = pick.candidates.map((range) =>
+        '  - seq ' + range.start + '..' + range.end + ' — ' + range.count + ' messages, ~' + range.tokens + ' tokens — fold costs ~' + range.foldCostTokens + ' once',
+      )
+      return {
+        text: 'compress: condense folded nothing — ' + pick.reason + '.\n'
+          + 'Compare against the automatic checkpoint it replaces: a host checkpoint costs a fully cold prefill (~130 s here), so waiting is cheaper only while nothing is consumed.\n'
+          + (rows.length > 0
+            ? 'Eligible runs you can fold explicitly:\n' + rows.join('\n')
+            : 'No eligible run yet — keep working; consumed spans reappear in the next nudge.'),
+      }
+    }
+    // Working-set guard (Appendix D of arXiv 2611.05306): on an open-weight
+    // engine a fold that leaves a shallow working set is the regime where
+    // benchmark scores collapse, and the failure is not recoverable by a better
+    // note. Advisory first, hard only here — the model can force it, because
+    // overflow pressure is a legitimate reason to accept a thin context.
+    const forced = args.force === true || args.condense.force === true
+    const floor = foldPricingFor(env).floorTokens ?? 0
+    let degradedNote = ''
+    let degradedPick: CondensePick | undefined
+
+    if (pick.belowFloor && !forced) {
+      const minimum = Math.max(MIN_DEGRADED_FOLD_TOKENS, Math.floor(floor / 2))
+      if (!condenseDegradable(pick, minimum)) {
+        return { text: condenseFloorRefusal(pick, floor) }
+      }
+      // DEGRADED ELECTION (round-4 Q1/Q4): NO eligible row could keep the floor, so
+      // refusing is a deadlock with no compliant move — a real reclaim beats a
+      // permanent refusal. The stamp is ONE delimited, machine-readable line so a
+      // later floor statistic, a search hit or a distill can recognise it instead
+      // of reading this as a compliant fold.
+      degradedPick = { ...pick, degraded: true }
+      degradedNote = '\n[dsh:degraded] no eligible row could keep the working-set floor: this fold leaves ~'
+        + pick.liveAfterFoldTokens + ' of ~' + floor + ' tokens. Provenance of a desperate fold, not a proposal.'
+    }
+
+    // ONE number for both gates, priced as the note is STORED: the summary frame prefix the
+    // checkpoint node carries plus the degrade stamp, counted over the concatenated text the
+    // transaction actually writes (`note + degradedNote`) rather than two separate counts, so
+    // the two `defaultCountTokens` calls cannot drift by a token at the join (round-13 review
+    // Q1). A bare `defaultCountTokens(note)` under-priced the resident node by ~16-35 tokens.
+    const storedSummary = note + degradedNote
+    const noteTokens = defaultCountTokens(withSummaryFramePrefix(storedSummary))
+    // A note that is a third the size of the stretch is a second copy, not a
+    // briefing — refuse BEFORE anything lands, so the model can rewrite and resend
+    // without paying a second re-prefill (nothing was written).
+    const weight = noteWeightRatio(note, pick.tokens, noteTokens)
+    if (weight > MAX_NOTE_WEIGHT_RATIO) {
+      return { text: noteWeightRejection(note, pick.tokens, noteTokens, degradedNote !== '') }
+    }
+
+    // PAYBACK RE-PRICED WITH THE REAL NOTE (round-9 review, GLM): the note stays resident on
+    // every later request, so the saving side is the folded volume MINUS the note, and it also
+    // sits AT the rewrite point so the next request prefills it uncached once.
+    // UNDER WINDOW PRESSURE the payback horizon steps aside (round-12 review Q5.1) — but it
+    // steps aside for a fold that buys REAL headroom, not for any positive saving: at ≥85% of
+    // the window a fold that reclaims a few hundred tokens spends a permanent barrier and a
+    // full re-prefill and leaves the session on the same cliff one step later (round-13 review
+    // Q2). What NEVER steps aside: the working-set floor and the note-weight gate above.
+    const payback = condenseNotePayback(pick.tokens, pick.foldCostTokens, noteTokens)
+    const reliefFloor = reliefMinSavingTokens(pick.pressureRelief, pick.reliefLimitTokens)
+    if (!payback.worth && !(pick.pressureRelief && payback.netSaving >= reliefFloor)) {
+      const horizon = Number.isFinite(payback.payback)
+        ? `Payback needs ~${payback.payback} requests and the horizon is ${CONDENSE_PAYBACK_REQUESTS}. Fold a bigger stretch, write a shorter note, or send the span as an explicit content range when you know this session has longer to run.`
+        : `Nothing is saved at any horizon: a note this size leaves ${payback.netSaving} tokens per request, so NO session length and NO explicit content range makes this fold positive — the only correct move is a materially shorter note or a bigger stretch.`
+      // Q2 (round-14): the model has already written its note, so the refusal must hand it the
+      // number that works — the largest note that still pays back inside the horizon.
+      const budgetHint = Number.isFinite(pick.noteBudgetTokens) && pick.noteBudgetTokens >= MIN_HANDOFF_NOTE_TOKENS
+        ? ` A note of at most ~${pick.noteBudgetTokens} stored tokens (frame prefix included) still pays back inside ${CONDENSE_PAYBACK_REQUESTS} requests.`
+        : ''
+      const reliefLine = pick.pressureRelief
+        ? ` You are past the relief threshold, but relief still requires a net reclaim of at least ~${reliefFloor} tokens (2% of the window) — a fold that saves less spends a permanent barrier and a full re-prefill for nothing.`
+        : ''
+      return { text:
+        `condense refused: the note (~${noteTokens} tokens, stored form including the summary frame prefix${degradedNote !== '' ? ' and the [dsh:degraded] line' : ''}) stays resident on every later request, so ${payback.netSaving} tokens are really saved against a ~${pick.foldCostTokens}-token re-prefill. ${horizon}${budgetHint}${reliefLine}`,
+      }
+    }
+    condensePick = degradedPick ?? pick
+    args = {
+      ...args,
+      content: [{
+        startSeq: pick.start,
+        endSeq: pick.end,
+        summary: note + degradedNote,
+        topic: args.condense.topic,
+        verifiedReadings: args.condense.verifiedReadings,
+      }],
+    }
+  }
   // Items-level required check AFTER the envelope peel (see
   // validateContentItems for why the schema gate alone cannot do this).
   validateContentItems(args.content!)
@@ -696,6 +1311,22 @@ async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: To
     const instructionHits = guardedRowsInSpan(guardedSeqs, shadowedSpan)
     if (instructionHits.length > 0) {
       rejectedNotes.push(protectedRowRejectionNote(resolved.start, resolved.end, instructionHits, shadowedSpan, session))
+      continue
+    }
+    // The working-set floor applies to a model-NAMED range too (cross-review Q1:
+    // all three reviewers). The guard protects the post-fold working set, and an
+    // explicit range that folds down to a sliver violates it exactly as hard as an
+    // elected one — while still paying the full one-time re-prefill. Same pricing
+    // implementation as the table rows (foldSpanPricing), so a row marked
+    // "below floor" and the guard can never disagree.
+    // `forced` covers the content range condense synthesized above, and so does the
+    // plan's own `degraded` flag: the guard reads the decision the election already
+    // made instead of a mutable bypass, so the two guards cannot disagree.
+    const priced = foldSpanPricing(session, resolved.start, resolved.end, foldPricingFor(env))
+    if (priced.belowFloor && args.force !== true && args.condense?.force !== true && condensePick?.degraded !== true) {
+      rejectedNotes.push(
+        '  seq ' + resolved.start + '..' + resolved.end + ' would leave ~' + priced.liveAfterTokens + ' tokens visible, under the working-set floor ~' + (foldPricingFor(env).floorTokens ?? 0) + ' — one fold costs the SAME single re-prefill, so this span is too thin to earn it back. Do NOT just widen blindly: current instruction copies, the newest skill catalog and the active user turn are refused by a DIFFERENT guard (they appear as their own rejection line when hit), so widen only across rows that stay eligible, or fold several disjoint slices in ONE call. Read consumed bytes back from files instead of folding. force:true bypasses THIS floor only — never the guarded rows. Other ranges in this batch already landed, so do not resend this one unchanged.',
+      )
       continue
     }
     // An edge on an ACTIVE block's checkpoint summary node resolves to the
@@ -898,10 +1529,41 @@ async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: To
     )
   }
 
+  // Baseline for the nudge cost line: the request after a replace re-prefills
+  // almost the whole surface once, and the delta is what that fold actually cost.
+  if (applied.result.blocksCreated > 0) recordCompressCost(session, providerUsage(agent))
+
   const summaryLine = `Compressed ${applied.result.blocksCreated} block(s), ~${applied.result.tokensCompressed} tokens reclaimed.`
+  // What the elected fold costs the NEXT request, in the currency the model
+  // optimizes with (tokens, not seconds — the prefill rate is host-specific and
+  // unverified here). Measured 2026-11-15: the slot reuses the prompt prefix up to
+  // the rewrite point and re-prefills EVERYTHING after it — and nothing before it,
+  // which is where the fixed request head (system prompt, tool registry, injected
+  // rows) lives. Adding the paired request overhead here double-counted that head
+  // and pushed the payback gate above what the host bills (round-10 review B1); the
+  // overhead now belongs only to the emergency projection in src/index.ts.
+  const condenseLine = condensePick === undefined || applied.result.blocksCreated === 0
+    ? ''
+        : (() => {
+            const noteTok = defaultCountTokens(withSummaryFramePrefix(args.content?.[0]?.summary ?? ''))
+            const priced = condenseNotePayback(condensePick.tokens, condensePick.foldCostTokens, noteTok)
+            const even = Number.isFinite(priced.payback) ? ` — it breaks even after ~${priced.payback} further requests` : ''
+            return `  condense elected seqs ${condensePick.start}..${condensePick.end} (~${condensePick.tokens} tokens removed); the next request re-prefills ~${condensePick.foldCostTokens} tokens ONCE — every token AFTER the rewrite point, because the fixed request head (system prompt, tool registry) sits BEFORE it and a warm cache reuses it (an injected row that landed AFTER the rewrite point is inside this price, not reused) — and this note (~${noteTok} tokens) stays resident on every request after it, saving ~${priced.netSaving} each${even}.\n  Batching spans into ONE call pays a single re-prefill, measured from the EARLIEST rewrite point of that batch; splitting them across calls pays one re-prefill each, so batch only what you would fold anyway — folding an early span to reach a later one pays the early span's whole suffix.`
+          })()
   const totalSkipped = skippedRanges + alreadyCompressedNotes.length + duplicateRangeNotes.length + rejectedNotes.length
   const failedLines = applied.result.errors.map((error) => `  ${error}`)
+  const condenseAdvisories = condensePick === undefined || applied.result.blocksCreated === 0
+    ? []
+    : [
+        ...(condenseNoteGaps(args.condense?.summary ?? '').length > 0
+          ? ['  condense note is missing Appendix G field(s): ' + condenseNoteGaps(args.condense?.summary ?? '').join(', ') + ' — Verification and Dead ends are the ones a resumed session re-derives most expensively.']
+          : []),
+        ...(condensePick?.degraded === true
+          ? ['  DEGRADED election: no eligible row could keep the working-set floor, so this fold went below it on purpose. The STORED note carries the [dsh:degraded] line — that line is the single source; this line only quotes it so you know now, in this turn, instead of discovering it after the next re-prefill.']
+          : []),
+      ]
   const warningLines = [
+    ...condenseAdvisories,
     ...freeWarnings.map((warning) => `  ${warning}`),
     ...failedLines,
     ...alreadyCompressedNotes,
@@ -913,7 +1575,7 @@ async function handleCompress(env: ToolEnvironment, args: CompressArgs, exec: To
   const footer = totalSkipped > 0
     ? `  (${totalSkipped} range(s) skipped or failed — see above)`
     : ''
-  return { text: `${summaryLine}\n${[...warningLines, footer].filter((line) => line !== '').join('\n')}` }
+  return { text: `${summaryLine}\n${[...warningLines, condenseLine, footer].filter((line) => line !== '').join('\n')}` }
 }
 
 const decompressParameters = {
