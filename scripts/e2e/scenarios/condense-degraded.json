@@ -1,0 +1,48 @@
+{
+  "name": "condense-degraded",
+  "persona": "You are a concise coding agent.",
+  "engine": {
+    "modelContextLimit": 110000,
+    "autoCommand": false
+  },
+  "userTurns": [
+    {
+      "filler": {
+        "topic": "pruning",
+        "count": 420
+      }
+    },
+    {
+      "filler": {
+        "topic": "ledger",
+        "count": 60
+      }
+    },
+    "Condense the session now — pick the stretch yourself and write the handoff note."
+  ],
+  "responses": [
+    {
+      "kind": "text",
+      "filler": {
+        "topic": "pruning",
+        "count": 420
+      }
+    },
+    {
+      "kind": "text",
+      "filler": {
+        "topic": "ledger",
+        "count": 60
+      }
+    },
+    {
+      "kind": "tool",
+      "name": "compress",
+      "argsTemplate": "{\"condense\":{\"summary\":\"## Goal\\nVerify the degraded election on a real host: every eligible row strands the working set, so condense must fold the largest one and stamp it.\\n## Next\\nRead the follow-up request cost and report.\\nEstablished facts: E2E-DEGRADED-MARKER-2b9c — the first exchange is consumed, the second stays live work.\\nRemaining plan: nothing else to fold.\",\"topic\":\"condense degraded\"}}"
+    },
+    {
+      "kind": "text",
+      "text": "Folded the consumed exchange and stamped the degrade."
+    }
+  ]
+}

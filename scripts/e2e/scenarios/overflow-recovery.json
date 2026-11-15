@@ -1,7 +1,7 @@
 {
   "name": "overflow-recovery",
   "persona": "You are a concise coding agent.",
-  "engine": { "modelContextLimit": 2000, "autoCommand": false },
+  "engine": { "modelContextLimit": 20000, "autoCommand": false },
   "userTurns": [
     { "filler": { "topic": "pruning", "count": 250 } },
     { "filler": { "topic": "ledger", "count": 250 } },

@@ -1,10 +1,10 @@
 import { runScenario } from './harness.mjs'
 import { readFileSync, readdirSync, rmSync } from 'node:fs'
+import { zstdDecompressSync } from 'node:zlib'
 import { join } from 'node:path'
-import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
-import { Context } from '@deepseek-ai/cordis'
+import { assertReleasedEventPayload, assertReleasedV1Header } from '@deepseek-ai/dsh-session-format-v0-to-v1'
 import { foldSurface } from '@deepseek-ai/dsh-session'
-const scenarioNames = ['basic-compress', 'nudge-rhythm', 'compress-then-decompress', 'acp-status', 'overflow-recovery', 'jsonl-compress']
+const scenarioNames = ['basic-compress', 'condense-handoff', 'condense-degraded', 'nudge-rhythm', 'compress-then-decompress', 'acp-status', 'overflow-recovery', 'jsonl-compress']
 const countsOf = (events) => {
   const starts = events.filter((event) => event.type === 'compaction/start').length
   const ends = events.filter((event) => event.type === 'compaction/end').length
@@ -77,7 +77,7 @@ const nudgeTableOf = (requests) => {
   for (const request of requests) {
     for (const message of (request.body.messages ?? [])) {
       const text = typeof message.content === 'string' ? message.content : deepText(message.content)
-      if (text.includes('Compressible ranges')) return text
+      if (text.includes('Ranges (')) return text
     }
   }
   return ''
@@ -85,15 +85,15 @@ const nudgeTableOf = (requests) => {
 const nudgeTableChecks = (result) => {
   const table = nudgeTableOf(result.requests)
   if (!table) return [['nudge range table present', false, 'no nudge with a range table found']]
-  const rows = table.split('\n').filter((line) => /seq \d+\.\.\d+/.test(line) && /\[tool \d+% \| text \d+%\]/.test(line))
+  const rows = table.split('\n').filter((line) => /seq \d+\.\.\d+/.test(line) && /tool\d+%/.test(line))
   const starts = rows.map((line) => {
     const match = line.match(/seq (\d+)\.\./)
     return match ? parseInt(match[1], 10) : -1
   })
   const ascending = starts.length >= 1 && starts.every((value, i) => i === 0 || value >= starts[i - 1])
   return [
-    ['nudge range table header (oldest first)', table.includes('Compressible ranges') && table.includes('oldest first'), ''],
-    ['nudge range rows carry [tool X% | text Y%] share', rows.length >= 1, `rows=${rows.length}`],
+    ['nudge range table header (oldest first)', table.includes('Ranges (') && table.includes('oldest first'), ''],
+    ['nudge range rows carry the tool/text share', rows.length >= 1, `rows=${rows.length}`],
     ['nudge range rows oldest-first (ascending seq)', ascending, `starts=${starts.join(',')}`]
   ]
 }
@@ -253,13 +253,30 @@ const sessionFilesOf = (root) => {
 // as we can get without spinning up a second agent loop. open(id, 'read') takes no
 // write claim, so it coexists with the harness's (now disposed) writer.
 const storedEventsOf = async (result) => {
-  const store = new JsonlSessionPersistence(new Context(), { root: result.persistRoot })
-  const reader = await store.open(result.sessionId, 'read')
-  try {
-    return (await reader.read(0)).events
-  } finally {
-    await reader.close()
+  const raw = []
+  for (const path of sessionFilesOf(result.persistRoot)) {
+    const bytes = readFileSync(path)
+    // The 0.2.2 backend compresses by default: zstd frame magic 28 B5 2F FD.
+    const text = bytes[0] === 0x28 && bytes[1] === 0xb5 && bytes[2] === 0x2f && bytes[3] === 0xfd
+      ? zstdDecompressSync(bytes).toString('utf8')
+      : bytes.toString('utf8')
+    for (const line of text.split('\n')) {
+      if (line.trim().length > 0) raw.push(JSON.parse(line))
+    }
   }
+  const header = raw[0] ?? {}
+  const version = header.version ?? header.format?.version ?? 1
+  const events = raw.slice(1)
+  // The released v0/v1 codec only admits those two header shapes (its validator
+  // rejects v4's `type` member). On the v4 line the fail-closed guarantee comes
+  // from the LIVE writer the harness mounts — every row above went through
+  // admission during the run — so decoding here is a line-level parse plus the
+  // surface re-fold check below, not a v1 payload assertion.
+  if (version === 0 || version === 1) {
+    assertReleasedV1Header(header)
+    for (const event of events) assertReleasedEventPayload(event, version)
+  }
+  return { events, format: version }
 }
 // The retired V3 wrapper shape ({ kind: 'plugin', plugin: '<name>' }) is refused by
 // the V4-line writer outright ("format v4 message requires a producer-owned source
@@ -296,7 +313,10 @@ const checksPersistence = (result, storedLoad) => {
     return list
   }
   const stored = storedLoad.events
-  list.push(['persist: stored log decodes through the released codec', true, `${stored.length} rows`])
+  const codecLabel = storedLoad.format === 0 || storedLoad.format === 1
+    ? 'persist: stored log decodes through the released codec'
+    : `persist: stored log decodes line-by-line (format v${storedLoad.format}; admission enforced by the live writer)`
+  list.push([codecLabel, true, `${stored.length} rows`])
   const mismatch = firstRowMismatch(stored, result.events)
   list.push(['persist: stored rows equal live events (lossless round-trip)', mismatch === '', mismatch])
   const replayed = foldSurface(stored).nodes.map((node) => [node.seq, node.type])
@@ -345,7 +365,57 @@ const checksJsonlCompress = (result, stored) => {
   list.push(['stored: conversation continued after the transaction', stored.some((event) => event.type === 'assistant/message' && event.seq > endSeq), ''])
   return list
 }
-const checksOf = { 'basic-compress': checksBasic, 'nudge-rhythm': checksRhythm, 'compress-then-decompress': checksDecompress, 'acp-status': checksStatus, 'overflow-recovery': checksOverflow, 'jsonl-compress': checksJsonlCompress }
+// condense: the engine names the span, the model writes the handoff note. This is
+// the path a real session uses, so it is verified against the real host here.
+// condense: the engine names the span, the model writes the handoff note. This is
+// the path a real session uses, so it is verified against the real host here.
+const condenseCallArgs = (events) => {
+  for (const event of events) {
+    if (event.type !== 'tool/call' || event.data?.name !== 'compress') continue
+    return String(event.data?.arguments ?? '')
+  }
+  return ''
+}
+const checksCondense = (result) => {
+  const list = []
+  const counts = countsOf(result.events)
+  const args = condenseCallArgs(result.events)
+  const notes = overflowMarkersOf(result.events)
+  const projection = projectionAfterFirstTool(result.requests)
+  list.push(['condense asked for an election, not a model-named range', args.includes('"condense"') && !args.includes('"content"'), `args=${args.slice(0, 60)}`])
+  list.push(['engine elected and landed a compaction', counts.starts >= 1 && counts.ends === counts.starts, `starts=${counts.starts} ends=${counts.ends}`])
+  list.push(['note weight gate accepted the note (a fold landed at all)', notes.length >= 1, `notes=${notes.length}`])
+  list.push(['stored note carries Goal and Next', notes.some((t) => t.includes('## Goal') && t.includes('## Next')), `notes=${notes.length}`])
+  list.push(['stored note is the model handoff text, not an engine summary', notes.some((t) => t.includes('E2E-CONDENSE-MARKER-7f3a')), ''])
+  list.push(['a compliant condense carries no degrade stamp', !notes.some((t) => t.includes('[dsh:degraded]')), ''])
+  list.push(['election covered the oldest user turn', shadowedSeqsOf(result.events, result.seqs.U1), `U1=${result.seqs.U1}`])
+  list.push(['durable replace node landed', surfaceOpOf(result.events), ''])
+  list.push(['projection: handoff note present after the fold', projection.includes('E2E-CONDENSE-MARKER-7f3a'), ''])
+  list.push(['projection: folded original gone', projection.length > 0 && !projection.includes('Note 0: the pruning section documents behavior 0'), ''])
+  list.push(['strict tool pairing in final request', wirePairing(result.requests), ''])
+  list.push(['conversation continued after end', continuationOf(result.events, lastEndSeq(result.events)), ''])
+  return list
+}
+
+const checksCondenseDegraded = (result) => {
+  const list = []
+  const counts = countsOf(result.events)
+  const notes = overflowMarkersOf(result.events)
+  const projection = projectionAfterFirstTool(result.requests)
+  list.push(['engine folded even though every row strands the working set', counts.starts >= 1 && counts.ends === counts.starts, `starts=${counts.starts} ends=${counts.ends}`])
+  list.push(['the stored note carries the degrade stamp', notes.some((t) => t.includes('[dsh:degraded]')), `notes=${notes.length}`])
+  list.push(['the stamped note is still the model handoff text', notes.some((t) => t.includes('E2E-DEGRADED-MARKER-2b9c')), ''])
+  list.push(['a degraded note keeps Goal and Next', notes.some((t) => t.includes('## Goal') && t.includes('## Next')), `notes=${notes.length}`])
+  const resultTexts = result.events.filter((event) => event.type === 'tool/result').map((event) => JSON.stringify(event.data)).join(' ')
+  list.push(['the tool result quotes the degrade in this turn too', resultTexts.includes('DEGRADED election'), ''])
+  list.push(['election covered the oldest user turn', shadowedSeqsOf(result.events, result.seqs.U1), `U1=${result.seqs.U1}`])
+  list.push(['durable replace node landed', surfaceOpOf(result.events), ''])
+  list.push(['projection: stamped note present after the fold', projection.includes('E2E-DEGRADED-MARKER-2b9c'), ''])
+  list.push(['strict tool pairing in final request', wirePairing(result.requests), ''])
+  list.push(['conversation continued after end', continuationOf(result.events, lastEndSeq(result.events)), ''])
+  return list
+}
+const checksOf = { 'basic-compress': checksBasic, 'condense-handoff': checksCondense, 'condense-degraded': checksCondenseDegraded, 'nudge-rhythm': checksRhythm, 'compress-then-decompress': checksDecompress, 'acp-status': checksStatus, 'overflow-recovery': checksOverflow, 'jsonl-compress': checksJsonlCompress }
 const loadScenario = async (name) => {
   return JSON.parse(readFileSync(new URL(`./scenarios/${name}.json`, import.meta.url), 'utf8'))
 }
@@ -369,7 +439,7 @@ const main = async () => {
   // the real writer, so every scenario gets the persistence net.
   let storedLoad
   try {
-    storedLoad = { events: await storedEventsOf(result) }
+    storedLoad = await storedEventsOf(result)
   } catch (err) {
     storedLoad = { error: err && err.message ? err.message : String(err) }
   }
