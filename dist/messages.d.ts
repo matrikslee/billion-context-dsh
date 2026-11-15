@@ -128,7 +128,13 @@ export declare function isEngineWrittenSummary(text: string): boolean;
  * hidden to get the request under the window and where the originals still
  * live (the append-only log: search_context/decompress rebuild from it).
  */
-export declare function overflowMarkerSummary(hiddenCount: number): string;
+/**
+ * Emergency marker summary. `provenance` is appended when present: a below-floor
+ * desperation fold MUST be distinguishable from a legitimate one when someone (or
+ * a later heuristic) reads this block — otherwise every floor statistic computed
+ * from durable folds is reading a lie (cross-review item 1).
+ */
+export declare function overflowMarkerSummary(hiddenCount: number, provenance?: string): string;
 /**
  * Kernel block id per compaction id, read from the durable block ledger.
  *
@@ -178,6 +184,7 @@ export declare function attachmentsOfEvent(event: SessionEvent): {
     images: number;
     files: number;
 };
+export declare function spillPathsOfEvent(event: SessionEvent): readonly string[];
 /**
  * The image/file blocks themselves (not just their counts), in document order.
  * The compressible-range rows price these with the fixed-heuristic media price
@@ -261,6 +268,16 @@ export declare function sourcePluginOf(source: {
     kind?: unknown;
     plugin?: unknown;
 } | undefined): string | undefined;
+/**
+ * True for the nudge rows THIS engine injects, in every durable shape: the V4
+ * producer kind `plugin:acp-nudge` (what src/nudge.ts writes) and the legacy V3
+ * wrapper `{ kind: 'plugin', plugin: 'acp-nudge' }` older logs carry.
+ *
+ * The sweep that prunes superseded nudges (src/region.ts pruneStaleNudgeRows)
+ * shares this predicate with the classifier, so "what is our own echo" cannot
+ * disagree between the two paths.
+ */
+export declare function isAcpNudgeRow(event: SessionEvent): boolean;
 /**
  * True for AGENTS.md instruction rows in ALL host shapes: the hook shape
  * (`kind:'agent-instructions'`, form 'instructions'), the legacy V3 wrapper

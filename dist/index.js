@@ -6550,8 +6550,8 @@ var ENGINE_SUMMARY_LEAD = "[engine-written summary \u2014 context-overflow emerg
 function isEngineWrittenSummary(text) {
   return text.startsWith(ENGINE_SUMMARY_LEAD);
 }
-function overflowMarkerSummary(hiddenCount) {
-  return `${ENGINE_SUMMARY_LEAD}: ${hiddenCount} surface message(s) hidden because the provider rejected the request as exceeding the context window. The originals are intact in the session log \u2014 use search_context or decompress (see acp_status) to read them, or re-run the compress tool over this range to write a proper summary.]`;
+function overflowMarkerSummary(hiddenCount, provenance) {
+  return `${ENGINE_SUMMARY_LEAD}: ${hiddenCount} surface message(s) hidden because the provider rejected the request as exceeding the context window. The originals are intact in the session log \u2014 use search_context or decompress (see acp_status) to read them, or re-run the compress tool over this range to write a proper summary.${provenance === void 0 ? "" : " EMERGENCY PROVENANCE: " + provenance}]`;
 }
 function kernelBlockIdByCompactionId(events) {
   const map = /* @__PURE__ */ new Map();
@@ -6676,6 +6676,76 @@ function countAttachments(content, counts) {
 function attachmentsOfEvent(event) {
   return countAttachmentBlocks(contentBlocksOfEvent(event));
 }
+var SPILL_KEY = /^(?:stdout|stderr)?[Ss]pillPaths?$/;
+var SPILL_PROSE_DIR = /^\/[^\s)\]"'`]*\/dsh-(?:spill|subprocess)-[^/\s)\]"'`…*]+\/[^\s)\]"'`…*]+$/;
+function collectSpillProse(text, out) {
+  for (const match of text.matchAll(/\[output truncated; full output: (\/[^\s)\]"'`]+)\]/g)) {
+    if (SPILL_PROSE_DIR.test(match[1])) out.add(match[1]);
+  }
+  for (const match of text.matchAll(/\(Omitted \d+ bytes\. Full formatted result stored at: (\/[^\s()]+?\.(?:log|txt))[^)]*\)/g)) {
+    const path = match[1];
+    if (SPILL_PROSE_DIR.test(path)) out.add(path);
+  }
+}
+var spillCache = /* @__PURE__ */ new WeakMap();
+function spillPathsOfEvent(event) {
+  const key = event;
+  const cached = spillCache.get(key);
+  if (cached !== void 0) return cached;
+  const found = /* @__PURE__ */ new Set();
+  collectSpillPaths(contentBlocksOfEvent(event), found, 0, event.type === "tool/result");
+  const paths = Object.freeze([...found]);
+  spillCache.set(key, paths);
+  return paths;
+}
+function collectSpillPaths(node, out, depth, fromToolResult = false) {
+  if (node === null || node === void 0 || depth > 6) return;
+  if (typeof node === "string") {
+    if (fromToolResult && node.includes("/dsh-")) collectSpillProse(node, out);
+    if (!node.includes("pillPath")) return;
+    const trimmed = node.trimStart();
+    const isDocument = trimmed.startsWith("{") || /^\[\s*[{\[]/.test(trimmed);
+    const brace = isDocument ? 0 : trimmed.indexOf("{");
+    if (!isDocument) {
+      const close = trimmed.lastIndexOf("}");
+      if (brace < 0 || close <= brace) return;
+      if (!/spillPaths?"\s*:/i.test(node)) return;
+    }
+    const candidate = isDocument ? trimmed : trimmed.slice(brace, trimmed.lastIndexOf("}") + 1);
+    let parsed = null;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch {
+      parsed = null;
+    }
+    if (parsed !== null) {
+      collectSpillPaths(parsed, out, depth + 1, fromToolResult);
+      return;
+    }
+    const scan = isDocument ? trimmed : trimmed.slice(brace);
+    for (const match of scan.matchAll(/"(?:stdout|stderr)?[Ss]pillPaths?"\s*:\s*"([^"\\]+)"/g)) {
+      const value = match[1];
+      if (value.startsWith("/")) out.add(value);
+    }
+    for (const match of scan.matchAll(/"(?:stdout|stderr)?[Ss]pillPaths"\s*:\s*\[([^\]]*)/g)) {
+      for (const item of match[1].matchAll(/"(\/[^"\\]*)"/g)) out.add(item[1]);
+    }
+    return;
+  }
+  if (Array.isArray(node)) {
+    for (const item of node) collectSpillPaths(item, out, depth + 1, fromToolResult);
+    return;
+  }
+  if (typeof node !== "object") return;
+  for (const [key, value] of Object.entries(node)) {
+    if (SPILL_KEY.test(key)) {
+      if (typeof value === "string" && value !== "") out.add(value);
+      else if (Array.isArray(value)) {
+        for (const item of value) if (typeof item === "string" && item.startsWith("/")) out.add(item);
+      } else collectSpillPaths(value, out, depth + 1, fromToolResult);
+    } else collectSpillPaths(value, out, depth + 1, fromToolResult);
+  }
+}
 function mediaBlocksOfEvent(event) {
   const blocks = [];
   collectMediaBlocks(contentBlocksOfEvent(event), blocks);
@@ -6754,6 +6824,12 @@ function sourcePluginOf(source) {
     return name.length > 0 ? name : void 0;
   }
   return void 0;
+}
+function isAcpNudgeRow(event) {
+  if (event.type !== "user/message") return false;
+  const source = event.data.source;
+  if (!source) return false;
+  return sourcePluginOf(source) === "acp-nudge";
 }
 function isAgentInstructionsRow(event) {
   if (event.type !== "user/message") return false;
@@ -7208,6 +7284,50 @@ function rebuildBlockLedger(events) {
   blockLedgerCache.set(events, { len: events.length, ledger });
   return ledger;
 }
+var KV_BLOCK_TOKENS = 16384;
+var DEFAULT_FOLD_FLOOR_PCT = 0.15;
+function belowWorkingSetFloor(totalTokens, liveAfterTokens, floor) {
+  return floor !== void 0 && floor > 0 && totalTokens > floor && liveAfterTokens < floor;
+}
+function foldSpanPricing(session, startSeq, endSeq, pricing) {
+  const nodes = session.surface.nodes;
+  const suffix = surfaceSuffixTokens(session);
+  const total = suffix[0] ?? 0;
+  const from = nodes.indexOf(startSeq);
+  const to = nodes.indexOf(endSeq);
+  if (from < 0 || to < from) return { spanTokens: 0, liveAfterTokens: total, belowFloor: false };
+  const spanTokens = Math.max(0, total - (suffix[to + 1] ?? 0) + (suffix[from] - total));
+  const liveAfterTokens = Math.max(0, total - spanTokens);
+  const floor = pricing?.floorTokens;
+  return {
+    spanTokens,
+    liveAfterTokens,
+    belowFloor: belowWorkingSetFloor(total, liveAfterTokens, floor)
+  };
+}
+function nodePriceOf(event, seq, mediaPriceOf) {
+  const attachments = attachmentsOfEvent(event);
+  const mediaPrice = attachments.images + attachments.files > 0 ? (mediaPriceOf?.(seq) ?? 0) + hostMediaStructuralPrice(mediaBlocksOfEvent(event)) : 0;
+  return defaultCountTokens(extractEventText(event)) + mediaPrice;
+}
+var suffixCache = /* @__PURE__ */ new WeakMap();
+function surfaceSuffixTokens(session, mediaPriceOf) {
+  const nodes = session.surface.nodes;
+  const lastSeq = nodes.length > 0 ? nodes[nodes.length - 1] : -1;
+  const generation = session.surface.replaceGeneration;
+  const cached = suffixCache.get(nodes);
+  if (cached !== void 0 && cached.len === nodes.length && cached.lastSeq === lastSeq && cached.generation === generation && cached.mediaPriceOf === mediaPriceOf) {
+    return cached.suffix;
+  }
+  const suffix = new Array(nodes.length + 1).fill(0);
+  for (let index = nodes.length - 1; index >= 0; index -= 1) {
+    const seq = nodes[index];
+    const event = eventAtOf(session, seq);
+    suffix[index] = suffix[index + 1] + (event === void 0 ? 0 : nodePriceOf(event, seq, mediaPriceOf));
+  }
+  suffixCache.set(nodes, { len: nodes.length, lastSeq, generation, mediaPriceOf, suffix });
+  return suffix;
+}
 function isToolEvent(event) {
   if (event.type === "tool/result") return true;
   if (event.type !== "assistant/message") return false;
@@ -7298,6 +7418,7 @@ function stripOrphanedSurfaceToolMessages(session, inFlightCallIds = /* @__PURE_
   const callIdsBySeq = /* @__PURE__ */ new Map();
   const open = /* @__PURE__ */ new Map();
   const orphanResultSeqs = [];
+  const nudgeInsidePairs = [];
   const brokenResults = /* @__PURE__ */ new Map();
   for (let index = 0; index < nodes.length; index += 1) {
     const seq = nodes[index];
@@ -7324,7 +7445,15 @@ function stripOrphanedSurfaceToolMessages(session, inFlightCallIds = /* @__PURE_
         adjacent = true;
         for (let mid = call.index + 1; mid < index; mid += 1) {
           const midEvent = eventAtOf(session, nodes[mid]);
-          if (midEvent === void 0 || midEvent.type !== "tool/result") {
+          if (midEvent === void 0) {
+            adjacent = false;
+            break;
+          }
+          if (isAcpNudgeRow(midEvent)) {
+            nudgeInsidePairs.push(nodes[mid]);
+            continue;
+          }
+          if (midEvent.type !== "tool/result") {
             adjacent = false;
             break;
           }
@@ -7349,6 +7478,7 @@ function stripOrphanedSurfaceToolMessages(session, inFlightCallIds = /* @__PURE_
     }
   }
   const hiddenSet = new Set(orphanResultSeqs);
+  for (const seq of nudgeInsidePairs) hiddenSet.add(seq);
   for (const resultSeq of brokenResults.keys()) hiddenSet.add(resultSeq);
   for (const [callSeq, ids] of callIdsBySeq) {
     const brokenIds = brokenIdsByCallSeq.get(callSeq);
@@ -7411,6 +7541,57 @@ function newestSkillCatalogSeqOf(session) {
   }
   return null;
 }
+function staleInstructionRowsOf(session) {
+  const newest = newestInstructionSeqsOf(session);
+  const newestCatalog = newestSkillCatalogSeqOf(session);
+  const stale = /* @__PURE__ */ new Set();
+  for (const seq of session.surface.nodes) {
+    const event = eventAtOf(session, seq);
+    if (event === void 0 || classifySurfaceEvent(event) !== "instruction") continue;
+    if (newest.has(seq)) continue;
+    if (newestCatalog !== null && seq === newestCatalog) continue;
+    stale.add(seq);
+  }
+  return stale;
+}
+var STALE_NUDGE_NOTE = "(superseded pressure nudge \u2014 the newest nudge carries the live seqs)";
+var MIN_NUDGE_PRUNE_CHARS = 400;
+function staleNudgeRowsOf(session, preserve = 5) {
+  const nodes = session.surface.nodes;
+  let lastAnswer = -1;
+  for (let index = nodes.length - 1; index >= 0; index -= 1) {
+    const event = eventAtOf(session, nodes[index]);
+    if (event?.type === "assistant/message") {
+      lastAnswer = index;
+      break;
+    }
+  }
+  if (lastAnswer < 0) return [];
+  const protectedSeqs = protectedSurfaceSeqs(session, preserve);
+  const stale = [];
+  for (let index = 0; index < lastAnswer; index += 1) {
+    const seq = nodes[index];
+    const event = eventAtOf(session, seq);
+    if (event === void 0 || !isAcpNudgeRow(event)) continue;
+    if (protectedSeqs.has(seq)) continue;
+    if (extractEventText(event).length < MIN_NUDGE_PRUNE_CHARS) continue;
+    stale.push(seq);
+  }
+  return stale;
+}
+function pruneStaleNudgeRows(session, preserve = 5) {
+  let count = 0;
+  for (const seq of staleNudgeRowsOf(session, preserve)) {
+    try {
+      hideSurfaceSeqs(session, [seq], STALE_NUDGE_NOTE);
+      count += 1;
+    } catch {
+      continue;
+    }
+  }
+  return count;
+}
+var NO_FOLDABLE_INSTRUCTIONS = /* @__PURE__ */ new Set();
 function guardedSurfaceSeqsOf(session) {
   const guarded = /* @__PURE__ */ new Set();
   const newestInstructions = newestInstructionSeqsOf(session);
@@ -7455,7 +7636,7 @@ function protectedSurfaceSeqs(session, preserve) {
   if (newestCatalog !== null) protectedSeqs.add(newestCatalog);
   return protectedSeqs;
 }
-function compressibleSegmentsOf(session, fromIndex, toIndex, protectedSeqs, mediaPriceOf) {
+function compressibleSegmentsOf(session, fromIndex, toIndex, protectedSeqs, mediaPriceOf, foldableInstructionSeqs = NO_FOLDABLE_INSTRUCTIONS) {
   const nodes = session.surface.nodes;
   const segments = [];
   let current = null;
@@ -7467,13 +7648,13 @@ function compressibleSegmentsOf(session, fromIndex, toIndex, protectedSeqs, medi
     const seq = nodes[index];
     if (seq === void 0) continue;
     const event = eventAtOf(session, seq);
-    if (event === void 0 || protectedSeqs.has(seq) || isCheckpointNode(event) || isSystemNode(event) || classifySurfaceEvent(event) === "instruction") {
+    if (event === void 0 || protectedSeqs.has(seq) || isCheckpointNode(event) || isSystemNode(event) || classifySurfaceEvent(event) === "instruction" && !foldableInstructionSeqs.has(seq)) {
       flush();
       continue;
     }
     const attachments = attachmentsOfEvent(event);
-    const mediaPrice = attachments.images + attachments.files > 0 ? (mediaPriceOf?.(seq) ?? 0) + hostMediaStructuralPrice(mediaBlocksOfEvent(event)) : 0;
-    const tokens = defaultCountTokens(extractEventText(event)) + mediaPrice;
+    const spills = spillPathsOfEvent(event).length;
+    const tokens = nodePriceOf(event, seq, mediaPriceOf);
     const isTool = isToolEvent(event);
     if (current === null) {
       current = {
@@ -7483,7 +7664,8 @@ function compressibleSegmentsOf(session, fromIndex, toIndex, protectedSeqs, medi
         tokens,
         toolCount: isTool ? 1 : 0,
         images: attachments.images,
-        files: attachments.files
+        files: attachments.files,
+        spills
       };
     } else {
       current.start = Math.min(current.start, seq);
@@ -7491,6 +7673,7 @@ function compressibleSegmentsOf(session, fromIndex, toIndex, protectedSeqs, medi
       current.count += 1;
       current.tokens += tokens;
       current.toolCount += isTool ? 1 : 0;
+      current.spills += spills;
       current.images += attachments.images;
       current.files += attachments.files;
     }
@@ -7499,11 +7682,22 @@ function compressibleSegmentsOf(session, fromIndex, toIndex, protectedSeqs, medi
   return segments;
 }
 function buildCompressibleSeqRanges(session, kernelView, opts = {}) {
-  stripOrphanedSurfaceToolMessages(session);
+  stripOrphanedSurfaceToolMessages(session, openToolCallIds(session));
   const nodes = session.surface.nodes;
   const indexOfSeq = /* @__PURE__ */ new Map();
   for (let index = 0; index < nodes.length; index += 1) indexOfSeq.set(nodes[index], index);
   const protectedSeqs = protectedSurfaceSeqs(session, opts.preserveRecent ?? 5);
+  const foldableInstructionSeqs = opts.foldStaleInstructionRows === true ? staleInstructionRowsOf(session) : NO_FOLDABLE_INSTRUCTIONS;
+  const priceMemo = /* @__PURE__ */ new Map();
+  const meter = opts.mediaPriceOf;
+  const mediaPriceOf = meter === void 0 ? void 0 : (seq) => {
+    const seen = priceMemo.get(seq);
+    if (seen !== void 0) return seen;
+    const value = meter(seq);
+    priceMemo.set(seq, value);
+    return value;
+  };
+  const suffix = surfaceSuffixTokens(session, mediaPriceOf);
   const out = [];
   for (const range of kernelView.ranges) {
     const startSeq = seqOfKernelRef(kernelView.refs, range.startRef);
@@ -7516,11 +7710,13 @@ function buildCompressibleSeqRanges(session, kernelView, opts = {}) {
       Math.min(from, to),
       Math.max(from, to),
       protectedSeqs,
-      opts.mediaPriceOf
+      mediaPriceOf,
+      foldableInstructionSeqs
     );
     for (const segment of segments) {
       try {
         const { start, end } = resolveSurfaceRange(session, segment.start, segment.end);
+        const endIndex = indexOfSeq.get(end) ?? segment.end;
         out.push({
           start,
           end,
@@ -7528,13 +7724,44 @@ function buildCompressibleSeqRanges(session, kernelView, opts = {}) {
           tokens: segment.tokens,
           toolPct: segment.count > 0 ? Math.round(segment.toolCount / segment.count * 100) : 0,
           images: segment.images,
-          files: segment.files
+          files: segment.files,
+          spills: segment.spills,
+          liveAfterFoldTokens: Math.max(0, (suffix[0] ?? 0) - segment.tokens),
+          belowFloor: belowWorkingSetFloor(
+            suffix[0] ?? 0,
+            Math.max(0, (suffix[0] ?? 0) - segment.tokens),
+            opts.foldPricing?.floorTokens
+          ),
+          // Measured 2026-11-15 on the live host: a durable replace reuses the prompt
+          // prefix up to the rewrite point and re-prefills EVERYTHING AFTER IT
+          // (prompt 125,665 with reused 31,378, and 31,378 is NOT a multiple of the
+          // 2^14 KV block). The fixed request head — system prompt, tool registry,
+          // injected rows — sits BEFORE any rewrite point, so it lives inside that
+          // reused prefix and must NOT be added here. Measured the same day: two
+          // folds at two DIFFERENT rewrite points billed 51,122 uncached tokens in
+          // total afterwards, while the range table quoted ~92K for a row on the same
+          // surface — the overhead term was the gap (round-10 review B1). The overhead
+          // stays in the EMERGENCY fit check (src/index.ts), where the question is the
+          // post-fold live size, not the marginal re-prefill.
+          foldCostTokens: suffix[endIndex + 1] ?? 0
         });
       } catch {
       }
     }
   }
-  return out.sort((a, b) => a.start - b.start);
+  out.sort((a, b) => a.start - b.start);
+  const seenSpans = /* @__PURE__ */ new Set();
+  const unique = [];
+  for (const range of out) {
+    const key = `${range.start}..${range.end}`;
+    if (seenSpans.has(key)) continue;
+    seenSpans.add(key);
+    unique.push(range);
+  }
+  return unique;
+}
+function surfaceTokens(session) {
+  return surfaceSuffixTokens(session)[0] ?? 0;
 }
 function surfaceSummary(session) {
   const nodes = session.surface.nodes;
@@ -7776,6 +8003,20 @@ var AcpStateStore = class {
 import { defineTool, ToolArgsError } from "@deepseek-ai/dsh-tools";
 
 // src/config.ts
+var WORKING_SET_FLOOR_MIN_TOKENS = 8192;
+var WORKING_SET_FLOOR_MAX_TOKENS = KV_BLOCK_TOKENS;
+var MIN_DEGRADED_FOLD_TOKENS = 4096;
+function foldPricingFor(input) {
+  const pct2 = input.foldFloorPct ?? DEFAULT_FOLD_FLOOR_PCT;
+  return {
+    ...pct2 <= 0 ? {} : {
+      floorTokens: Math.min(
+        WORKING_SET_FLOOR_MAX_TOKENS,
+        Math.max(WORKING_SET_FLOOR_MIN_TOKENS, Math.round(input.modelContextLimit * pct2))
+      )
+    }
+  };
+}
 function kernelConfigFor(input) {
   const nudgePatch = {};
   if (input.nudgeMinContextLimitPct !== void 0) nudgePatch.minContextLimitPct = input.nudgeMinContextLimitPct;
@@ -7795,6 +8036,118 @@ function kernelConfigFor(input) {
 // src/nudge.ts
 import { createUserMessage as createUserMessage2 } from "@deepseek-ai/dsh-llm";
 
+// src/usage.ts
+function providerUsage(agent) {
+  const projections = agent.ctx?.get?.("sessionProjections");
+  const raw = projections?.snapshot?.(agent.session)?.values?.tokenUsage;
+  if (raw === void 0 || typeof raw.uncachedInputTokens !== "number") return void 0;
+  return {
+    uncachedInputTokens: raw.uncachedInputTokens ?? 0,
+    cacheReadTokens: raw.cacheReadTokens ?? 0,
+    cacheWriteTokens: raw.cacheWriteTokens ?? 0,
+    outputTokens: raw.outputTokens ?? 0
+  };
+}
+function totalRequestInput(usage) {
+  return usage.uncachedInputTokens + usage.cacheReadTokens + usage.cacheWriteTokens;
+}
+var peakCache = /* @__PURE__ */ new WeakMap();
+function peakRequestInput(session) {
+  const events = session.snapshotEvents();
+  const asKey = events;
+  const cached = peakCache.get(asKey);
+  if (cached !== void 0 && cached.len === events.length) return cached.peak;
+  let peak = 0;
+  for (const event of events) {
+    if (event.type !== "assistant/message" && event.type !== "assistant/attempt") continue;
+    const usage = event.data.usage;
+    if (usage === void 0) continue;
+    const total = (usage.inputTokens ?? 0) + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0);
+    if (total > peak) peak = total;
+  }
+  peakCache.set(asKey, { len: events.length, peak });
+  return peak;
+}
+function lastRequestInput(session) {
+  return lastRequestUsage(session)?.tokens ?? 0;
+}
+function lastRequestUsage(session) {
+  const events = session.snapshotEvents();
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.type !== "assistant/message" && event.type !== "assistant/attempt") continue;
+    const usage = event.data.usage;
+    if (usage === void 0) continue;
+    return {
+      tokens: (usage.inputTokens ?? 0) + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0),
+      seq: event.seq
+    };
+  }
+  return void 0;
+}
+var requestPairs = /* @__PURE__ */ new WeakMap();
+var MAX_TOKENIZER_INFLATION = 2;
+var MIN_TOKENIZER_INFLATION = 1.05;
+var DEFAULT_OVERFLOW_INFLATION = 1.15;
+var surfaceAtPrevStep = /* @__PURE__ */ new WeakMap();
+var lastPaired = /* @__PURE__ */ new WeakMap();
+function lastRecordedSeq(session) {
+  const nodes = session.surface.nodes;
+  const surfaceTail = nodes.length > 0 ? nodes[nodes.length - 1] : 0;
+  const events = session.snapshotEvents();
+  const logTail = events.length > 0 ? events[events.length - 1].seq : 0;
+  return Math.max(surfaceTail, logTail);
+}
+function calibrateRequestPair(session, billed, billedSeq, surfaceNow) {
+  const previous = surfaceAtPrevStep.get(session);
+  if (previous !== void 0 && billed > 0 && billedSeq > previous.seq) {
+    const seen = lastPaired.get(session);
+    if (seen === void 0 || seen.billed !== billed || seen.anchorSeq !== previous.seq) {
+      recordRequestPair(session, billed, previous.tokens);
+      lastPaired.set(session, { billed, anchorSeq: previous.seq });
+    }
+  }
+  if (surfaceNow > 0) surfaceAtPrevStep.set(session, { tokens: surfaceNow, seq: lastRecordedSeq(session) });
+}
+function setCalibrationAnchor(session, surface) {
+  if (surface > 0) surfaceAtPrevStep.set(session, { tokens: surface, seq: lastRecordedSeq(session) });
+}
+var calibrationRoute = /* @__PURE__ */ new WeakMap();
+function setCalibrationRoute(session, routeKey) {
+  const previous = calibrationRoute.get(session);
+  if (previous === routeKey) return;
+  calibrationRoute.set(session, routeKey);
+  if (previous === void 0) return;
+  requestPairs.delete(session);
+  surfaceAtPrevStep.delete(session);
+  lastPaired.delete(session);
+}
+function recordRequestPair(session, billed, surface) {
+  if (billed <= 0 || surface <= 0) return;
+  requestPairs.set(session, { billed, surface });
+}
+function pairedInflation(session) {
+  const pair = requestPairs.get(session);
+  if (pair === void 0) return void 0;
+  return Math.min(MAX_TOKENIZER_INFLATION, Math.max(MIN_TOKENIZER_INFLATION, pair.billed / pair.surface));
+}
+function requestOverhead(session) {
+  const pair = requestPairs.get(session);
+  if (pair === void 0) return 0;
+  return Math.max(0, pair.billed - pair.surface);
+}
+var compressBaselines = /* @__PURE__ */ new WeakMap();
+function recordCompressCost(session, usage) {
+  if (usage === void 0) return;
+  const previous = compressBaselines.get(session);
+  compressBaselines.set(session, { uncached: usage.uncachedInputTokens, count: (previous?.count ?? 0) + 1 });
+}
+function costSinceLastCompress(session, usage) {
+  const baseline = compressBaselines.get(session);
+  if (baseline === void 0 || usage === void 0) return null;
+  return { delta: Math.max(0, usage.uncachedInputTokens - baseline.uncached), count: baseline.count };
+}
+
 // src/prompts.ts
 var NUDGE_ALLOWED = {
   normal: /* @__PURE__ */ new Set(["pct", "philosophy"]),
@@ -7803,12 +8156,13 @@ var NUDGE_ALLOWED = {
   tier: /* @__PURE__ */ new Set(["tier", "count", "prevTier", "tokens", "seqs", "firstSeq", "lastSeq"]),
   breakdown: /* @__PURE__ */ new Set(["system", "tool", "summaries", "code", "text"]),
   growth: /* @__PURE__ */ new Set(["growth"]),
-  tip: /* @__PURE__ */ new Set()
+  tip: /* @__PURE__ */ new Set(),
+  cacheCost: /* @__PURE__ */ new Set(["uncached", "count"])
 };
 var RANGE_TABLE_ALLOWED = {
   header: /* @__PURE__ */ new Set(["surface"]),
   title: /* @__PURE__ */ new Set(["count"]),
-  line: /* @__PURE__ */ new Set(["start", "end", "count", "tokens", "toolPct", "textPct", "media"]),
+  line: /* @__PURE__ */ new Set(["start", "end", "count", "tokens", "toolPct", "textPct", "media", "foldCost"]),
   footer: /* @__PURE__ */ new Set()
 };
 var TOOLS_ALLOWED = {
@@ -7880,19 +8234,20 @@ var DEFAULT_PROMPTS = {
     tier: "Tier {tier}: {count} tier-{prevTier} block(s) distillable ({tokens} tokens) \u2014 distill them by compressing their checkpoint seq(s) [seqs {seqs}] as one range: compress({ content: [{ startSeq: {firstSeq}, endSeq: {lastSeq}, summary }] }).",
     breakdown: "Context breakdown: {system}K system | {tool}K tool | {summaries}K summaries | {code}K code | {text}K text",
     growth: "+{growth}K since last nudge",
-    tip: "\u{1F4A1} Compress all ranges in one call (pass multiple content entries: `content: [{...}, {...}]`)."
+    tip: "\u{1F4A1} Compress all ranges in one call (pass multiple content entries: `content: [{...}, {...}]`).",
+    cacheCost: "Since last compress: +{uncached} uncached input tokens billed ({count} compress(es) so far) \u2014 a replace re-prefills everything the prompt carries AFTER the rewrite point ONCE, so fold rarely, in bulk, and no earlier than the consumed span forces."
   },
   rangeTable: {
     header: "Surface: {surface}",
-    title: "Compressible ranges ({count}, oldest first; exact surface seqs \u2014 usable as-is):",
-    line: "  - seq {start}..{end} \u2014 {count} messages, ~{tokens} tokens [tool {toolPct}% | text {textPct}%]{media}",
-    footer: "Compress with: compress({ content: [{ startSeq, endSeq, summary }] }) \u2014 content is an array: batch multiple unrelated segments in one call, each entry its own block. Keep ranges disjoint.\nSnapshot taken at nudge time: the seqs go stale once the surface moves (a later compress shadows them), so re-run acp_status for fresh refs before compressing.\nBefore you compress any row above, confirm it is truly consumed \u2014 if a span still holds live task state (where you are in the task / open TODOs, paths already ruled out, artifacts already done and where they live), carry that state into your summary or keep the span live. Compressing an in-progress span without carrying its state forces a full re-run afterward."
+    title: "Ranges ({count}, oldest first; seqs usable as-is):",
+    line: "  - seq {start}..{end} \xB7 {count}msg ~{tokens}t tool{toolPct}%{media} \xB7 fold ~{foldCost}",
+    footer: "fold = re-prefilling every token AFTER the rewrite point, paid ONCE (the fixed request head sits before every rewrite point, so a warm cache reuses it; an injected row that landed AFTER the rewrite point is inside this price); batch rows into ONE call and prefer the LATEST consumed rows (an earlier rewrite point re-reads more). compress({ content: [{ startSeq, endSeq, summary }] }); stale seqs mean re-run acp_status. A row marked N spilled has its bytes on a FILE, still readable from disk, so folding it loses nothing. A row marked below floor strands the working set \u2014 fold a row that STILL LEAVES the floor, or read from files. Only fold spans you have fully consumed: carry their open TODOs and artifact paths into the summary, or leave them live."
   },
   tools: {
-    compress: 'Replace older conversation ranges with dense summaries you write. Each message seq is a surface reference. Single range: compress({ content: [{ startSeq, endSeq, summary }] }). Batch multiple unrelated ranges in one call (each content entry becomes its own block); keep ranges disjoint. Never compress content the current step is actively using. Compress boundaries are SURFACE SEQS (acp_status Surface: row, latest nudge table) \u2014 NOT the block refs (bN, e.g. b1) that acp_status COMPRESSED BLOCKS shows, which are for decompress only. Drilldown mN refs (e.g. m00306) are ALSO accepted as startSeq/endSeq \u2014 they are auto-mapped to the live surface seq; an unknown mN (never assigned on the current surface) fails with guidance. Seq refs must come from the CURRENT surface (acp_status or the latest nudge): a span whose edges were shadowed by an earlier compress is auto-remapped to its still-live content, a fully compressed span is reported as already compressed, and invented/other-session seqs fail with guidance. Good compression moments: stage or subtask completion whose details you have fully consumed and will not re-check, strategy switches, intermediate milestones, and wrapping up failed exploration \u2014 when the details are consumed and no longer critical for the task ahead. Before compressing, ask: will I need to re-verify any detail from this range in this task? If yes, keep it live. When you write a summary, turn dead-end exploration into a conclusion (what was tried, why it failed, the next step) \u2014 not a blow-by-blow; and keep the summary the ONLY record: self-contained, so a later reader (or you, after decompress) can continue without the original. Optional verifiedReadings: string[] per content entry records acceptance readings that are already green (e.g. "t0-fastpath 8/8") \u2014 stored structurally on the compaction event so later steps need not re-run them.',
-    decompress: "Recover the original content of a compressed block by its blockId \u2014 the kernel block ref `bN` shown by acp_status (e.g. b1), or a compaction id from search_context (read-only; does not unshadow the range). Large blocks are paged so each page stays under the host tool-result trim budget (up to 100 messages per call): pass offset/limit to walk them and follow the continue hint in the result.",
+    compress: 'Replace older conversation ranges with dense summaries you write. Each message seq is a surface reference. Single range: compress({ content: [{ startSeq, endSeq, summary }] }). Batch multiple unrelated ranges in one call (each content entry becomes its own block); keep ranges disjoint. Never compress content the current step is actively using. Compress boundaries are SURFACE SEQS (acp_status Surface: row, latest nudge table). The block refs (bN, e.g. b1) that acp_status COMPRESSED BLOCKS shows are ALSO valid boundaries \u2014 naming the checkpoint node of a block is exactly how you DISTILL that block (tier 2/3); decompress takes the same bN. Drilldown mN refs (e.g. m00306) are ALSO accepted as startSeq/endSeq \u2014 they are auto-mapped to the live surface seq; an unknown mN (never assigned on the current surface) fails with guidance. Seq refs must come from the CURRENT surface (acp_status or the latest nudge): a span whose edges were shadowed by an earlier compress is auto-remapped to its still-live content, a fully compressed span is reported as already compressed, and invented/other-session seqs fail with guidance. Good compression moments: stage or subtask completion whose details you have fully consumed and will not re-check, strategy switches, intermediate milestones, and wrapping up failed exploration \u2014 when the details are consumed and no longer critical for the task ahead. Before compressing, ask: will I need to re-verify any detail from this range in this task? If yes, keep it live. When you write a summary, turn dead-end exploration into a conclusion (what was tried, why it failed, the next step) \u2014 not a blow-by-blow; and keep the summary the ONLY record: self-contained, so a later reader (or you, after decompress) can continue without the original. Optional verifiedReadings: string[] per content entry records acceptance readings that are already green (e.g. "t0-fastpath 8/8") \u2014 stored structurally on the compaction event so later steps need not re-run them. Engine-picked fold: compress({ condense: { summary } }) lets the engine elect the LARGEST eligible continuous run of the current surface and fold it in ONE replace while you write the handoff note \u2014 that note must carry ## Goal and ## Next. A fold makes the next request re-prefill every token AFTER the rewrite point ONCE, so the rewrite point IS the lever: prefer the LATEST consumed stretch and batch consumed spans into one call rather than folding small spans repeatedly.',
+    decompress: "Recover the original content of a compressed block by its blockId \u2014 the kernel block ref `bN` shown by acp_status (e.g. b1), or a compaction id from search_context (read-only; does not unshadow the range). Large blocks are paged so each page stays under the host tool-result trim budget (up to 100 messages per call): pass offset/limit to walk them and follow the continue hint in the result. Pass the narrowest page that answers the question (offset/limit) and locate the part you need with search_context first \u2014 a full dump re-pays every byte the fold removed.",
     searchContext: "Search inside compressed blocks (summaries and original content) for information the model no longer sees in context. When a summary lacks a detail you need (exact values, error strings, decisions, verbatim code), SEARCH the compressed blocks FIRST \u2014 never guess or reconstruct from memory: search_context(query) locates the right block, then decompress only that block to recover the original.",
-    acpStatus: 'Context status: overview of the current context \u2014 CONTEXT BREAKDOWN (tool/text/summaries token shares of the visible total), COMPRESSED BLOCKS ledger, and the nudge decision. No args = overview. Percentages are shares of the visible content, not the context window. Note: the block refs in COMPRESSED BLOCKS (bN, e.g. b1) are for decompress; compress uses the Surface: seq range, not bN. Drilldown: pass scope:"compressed" for a per-block list, or scope:"uncompressed" with view:"messages" (every visible message) / view:"ranges" (merged ranges); tool filters to one tool name, sort reorders (size/time/tool; age for compressed), limit caps rows (default 30). Drilldown row refs are kernel ids (mN) \u2014 feed them straight to compress as startSeq/endSeq (auto-mapped to the live surface seq); bN is for decompress, Surface: seqs also work in compress.'
+    acpStatus: 'Context status: overview of the current context \u2014 CONTEXT BREAKDOWN (tool/text/summaries token shares of the visible total), COMPRESSED BLOCKS ledger, and the nudge decision. No args = overview. Percentages are shares of the visible content, not the context window. Note: the block refs in COMPRESSED BLOCKS (bN, e.g. b1) work in BOTH tools \u2014 decompress reads the block, and compress accepts bN as a boundary to DISTILL that block (tier 2/3); plain spans use the Surface: seq range. Drilldown: pass scope:"compressed" for a per-block list, or scope:"uncompressed" with view:"messages" (every visible message) / view:"ranges" (merged ranges); tool filters to one tool name, sort reorders (size/time/tool; age for compressed), limit caps rows (default 30). Drilldown row refs are kernel ids (mN) \u2014 feed them straight to compress as startSeq/endSeq (auto-mapped to the live surface seq); bN also works as a compress boundary (it distills that block), Surface: seqs cover plain spans.'
   },
   systemPromptTemplate: `Active Context Pruning \u2014 model-driven context management
 
@@ -7917,8 +8272,21 @@ WHEN NOT TO COMPRESS:
 
 {howToCompressRules}
 
+CONDENSE \u2014 an engine-elected fold, for a long context with many turns still ahead:
+compress({ condense: { summary } }) elects the LARGEST eligible continuous run of the
+CURRENT surface and folds it in ONE replace \u2014 you do not name the span, you write the
+note. Walls the election never crosses: the newest injected instruction copy of every
+scope, the newest skill catalog, checkpoint carriers, the system node, the active user
+turn (superseded injection copies DO fold \u2014 they cannot come back). The note is the
+handoff of that stretch and must carry "## Goal" (what the work is and what remains)
+and "## Next" (the immediate next command plus the completion condition); without
+them nothing lands. Price: the next request re-prefills every token AFTER the
+rewrite point ONCE, so WHERE the rewrite lands is the lever \u2014 a fold near the tail
+barely re-reads anything, one near the head re-reads almost everything, and three
+small folds pay that re-prefill three times. Prefer the LATEST consumed stretch, fold
+in bulk, and not at all when nothing consumed is worth reclaiming.
 Compression tools (refs are SURFACE SEQS, not ids):
-- compress: replace one or more seq ranges, each with your own dense summary. Single range: compress({ content: [{ startSeq, endSeq, summary }] }). Batch multiple unrelated segments in one call (each entry becomes its own block): compress({ content: [{ startSeq: 1, endSeq: 5, summary: '...' }, { startSeq: 12, endSeq: 18, summary: '...' }] }). Keep ranges disjoint \u2014 overlapping entries in one batch are skipped. Edges are auto-balanced to tool-call/result boundaries; a trailing #callId fragment in a seq is ignored. Seq refs must be on the current surface: seqs from older nudges or earlier compresses go stale as the surface moves, so a stale span is auto-remapped to its still-live remainder (the result reports the adjusted span), a fully compressed span is reported as already compressed, and invented/other-session seqs fail with guidance. The block refs (bN, e.g. b1) in acp_status COMPRESSED BLOCKS are for decompress, NOT compress boundaries.
+- compress: replace one or more seq ranges, each with your own dense summary. Single range: compress({ content: [{ startSeq, endSeq, summary }] }). Batch multiple unrelated segments in one call (each entry becomes its own block): compress({ content: [{ startSeq: 1, endSeq: 5, summary: '...' }, { startSeq: 12, endSeq: 18, summary: '...' }] }). Keep ranges disjoint \u2014 overlapping entries in one batch are skipped. Edges are auto-balanced to tool-call/result boundaries; a trailing #callId fragment in a seq is ignored. Seq refs must be on the current surface: seqs from older nudges or earlier compresses go stale as the surface moves, so a stale span is auto-remapped to its still-live remainder (the result reports the adjusted span), a fully compressed span is reported as already compressed, and invented/other-session seqs fail with guidance. The block refs (bN, e.g. b1) in acp_status COMPRESSED BLOCKS are compress boundaries too \u2014 naming one folds the checkpoint node of that block, which is what makes the fold a tier 2/3 distillation; decompress accepts the same ref.
 - decompress: recover a compressed block's original content, read-only. decompress({ blockId }) \u2014 accept the bN ref shown by acp_status (e.g. b1) or a compaction id. Large blocks page (each page sized to stay under the host tool-result trim budget, up to 100 messages): pass offset/limit and follow the continue hint in the result.
 - search_context: when a summary lacks the details you need (exact values, error strings, decisions, verbatim code), SEARCH the compressed blocks FIRST \u2014 never guess or reconstruct from memory; search_context(query) locates the right block, decompress only that block.
 - acp_status: current context usage and the live compressible-range list. Run it right before compressing \u2014 the only seqs that never go stale are the ones you just read. Drilldown (scope/view/tool/sort/limit) lists per-message or per-block sizes; drilldown rows are kernel ids (mN) \u2014 compress accepts them directly (auto-mapped to the live surface seq).
@@ -8010,10 +8378,12 @@ function kernelRangeViewOf(nudge, state) {
   return { ranges: nudge.compressibleRanges ?? [], refs: state.messageRefs };
 }
 function mediaSuffixOf(range) {
-  if (range.images === 0 && range.files === 0) return "";
+  if (range.images === 0 && range.files === 0 && range.spills === 0 && !range.belowFloor) return "";
   const parts = [];
   if (range.images > 0) parts.push(`+${range.images} image${range.images === 1 ? "" : "s"}`);
   if (range.files > 0) parts.push(`+${range.files} file${range.files === 1 ? "" : "s"}`);
+  if (range.spills > 0) parts.push(`${range.spills} spilled`);
+  if (range.belowFloor) parts.push("below floor");
   return ` [${parts.join(" | ")}]`;
 }
 function meterMediaPriceResolver(agent, session) {
@@ -8023,11 +8393,18 @@ function meterMediaPriceResolver(agent, session) {
     return prices.get(seq) ?? 0;
   };
 }
-function rangeTable(session, kernelView, prompts = DEFAULT_RESOLVED, mediaPriceOf) {
+function rangeTable(session, kernelView, prompts = DEFAULT_RESOLVED, mediaPriceOf, foldPricing) {
   const ranges = buildCompressibleSeqRanges(
     session,
     kernelView,
-    mediaPriceOf === void 0 ? {} : { mediaPriceOf }
+    {
+      ...mediaPriceOf === void 0 ? {} : { mediaPriceOf },
+      // A row's price is the surface suffix after its END edge. The fixed request
+      // head sits BEFORE every rewrite point, so a warm cache reuses it and adding
+      // the paired overhead here double-counted it (round-10 review B1; the older
+      // overhead-inclusive price still read ~2.8x under on a real fold).
+      foldPricing
+    }
   ).slice(0, 6);
   if (ranges.length === 0) return "";
   const lines = ranges.map(
@@ -8038,7 +8415,8 @@ function rangeTable(session, kernelView, prompts = DEFAULT_RESOLVED, mediaPriceO
       tokens: range.tokens,
       toolPct: range.toolPct,
       textPct: 100 - range.toolPct,
-      media: mediaSuffixOf(range)
+      media: mediaSuffixOf(range),
+      foldCost: range.foldCostTokens
     })
   );
   return [
@@ -8122,7 +8500,9 @@ function buildNudge(agent, env, lastNudgeTurn, emergencyNudges, onEmergencyCapHi
     style,
     // The correction rides the nudge the engine is already injecting — no extra
     // message, no extra injection surface (the leak is otherwise silent).
-    style === "ptc" && env.ptcLeakNote === true
+    style === "ptc" && env.ptcLeakNote === true,
+    providerUsage(agent),
+    foldPricingFor(env)
   );
   const message = createUserMessage2({
     content: [{ type: "text", text }],
@@ -8136,20 +8516,20 @@ function buildNudge(agent, env, lastNudgeTurn, emergencyNudges, onEmergencyCapHi
   });
   return { message, emergency };
 }
-function buildNudgeText(nudge, emergency, session, kernelView, prompts = DEFAULT_RESOLVED, mediaPriceOf, style = "native", leakNote = false) {
-  const text = prompts.nudge !== DEFAULT_RESOLVED.nudge ? renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf, style) : adaptKernelNudgeToSeq(renderNudgeText(nudge).text, nudge, session, kernelView, prompts, mediaPriceOf, style);
+function buildNudgeText(nudge, emergency, session, kernelView, prompts = DEFAULT_RESOLVED, mediaPriceOf, style = "native", leakNote = false, usage, foldPricing) {
+  const text = prompts.nudge !== DEFAULT_RESOLVED.nudge ? renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf, style, usage, foldPricing) : adaptKernelNudgeToSeq(renderNudgeText(nudge).text, nudge, session, kernelView, prompts, mediaPriceOf, style, usage, foldPricing);
   return leakNote && style === "ptc" ? `${text}
 
 ${PTC_LEAK_CORRECTION}` : text;
 }
-function adaptKernelNudgeToSeq(text, nudge, session, kernelView, prompts, mediaPriceOf, style = "native") {
+function adaptKernelNudgeToSeq(text, nudge, session, kernelView, prompts, mediaPriceOf, style = "native", usage, foldPricing) {
   let out = stripNudgeGuidance(text);
   if ((nudge.tier === 2 || nudge.tier === 3) && (nudge.tierTargetBlocks?.length ?? 0) > 0) {
     out = replaceTierTrigger(out, nudge, session, prompts);
   } else if (out.includes('"startId"')) {
     out = replaceEmergencyExample(out, style);
   }
-  const seqTable = rangeTable(session, kernelView, prompts, mediaPriceOf);
+  const seqTable = rangeTable(session, kernelView, prompts, mediaPriceOf, foldPricing);
   if (seqTable !== "") out = replaceRangesStr(out, seqTable);
   out = insertContentFormNote(out, style);
   return ptcText(out, style);
@@ -8161,6 +8541,12 @@ function insertContentFormNote(text, style) {
   const tipAt = text.lastIndexOf("\n\n\u{1F4A1} ");
   if (tipAt === -1) return text;
   return text.slice(0, tipAt) + "\n\n" + contentFormNote(style) + text.slice(tipAt);
+}
+function cacheCostLine(prompts, session, usage) {
+  if (prompts.nudge.cacheCost === "") return "";
+  const cost = costSinceLastCompress(session, usage);
+  if (cost === null) return "";
+  return renderTemplate(prompts.nudge.cacheCost, { uncached: cost.delta, count: cost.count });
 }
 function replaceRangesStr(text, seqTable) {
   const match = text.match(/\n\n(?:Compressible ranges \(|\[No specific ranges detected)/);
@@ -8204,7 +8590,7 @@ function replaceEmergencyExample(text, style = "native") {
   const example = style === "ptc" ? "\n\nawait tools.compress({ content: [{ startSeq, endSeq, summary }] }) from inside `run_code` \u2014 use the seqs from the range table above." : "\n\ncompress({ content: [{ startSeq, endSeq, summary }] }) \u2014 use the seqs from the range table above.";
   return text.slice(0, start) + example + text.slice(end);
 }
-function renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf, style = "native") {
+function renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts, mediaPriceOf, style = "native", usage, foldPricing) {
   const pct2 = Math.round(Math.min(nudge.contextUsage, 1) * 100);
   const frame = renderTemplate(
     emergency ? prompts.nudge.emergency : prompts.nudge.normal,
@@ -8245,7 +8631,9 @@ function renderNudgeFromTemplates(nudge, emergency, session, kernelView, prompts
     const tierRules = nudge.tier === 2 ? TIER2_DISTILL_RULES : TIER3_CONDENSE_RULES;
     parts.push("", tierRules);
   } else {
-    parts.push(rangeTable(session, kernelView, prompts, mediaPriceOf));
+    const cacheCostText = cacheCostLine(prompts, session, usage);
+    if (cacheCostText !== "") parts.push(cacheCostText);
+    parts.push(rangeTable(session, kernelView, prompts, mediaPriceOf, foldPricing));
   }
   if (prompts.nudge.tip !== "") parts.push("", contentFormNote(style), "", prompts.nudge.tip);
   return ptcText(stripNudgeGuidance(parts.join("\n")), style);
@@ -8286,8 +8674,8 @@ function liveRoute(agent) {
 function routeFor(agent) {
   const live = liveRoute(agent);
   return {
-    provider: live?.provider ?? agent.options.provider ?? "",
-    model: live?.model ?? agent.options.model ?? ""
+    provider: live?.provider ?? agent.options?.provider ?? "",
+    model: live?.model ?? agent.options?.model ?? ""
   };
 }
 async function probeModelWindow(agent, provider, model) {
@@ -8391,6 +8779,21 @@ var compressParameters = {
       },
       additionalProperties: false
     }
+  },
+  force: {
+    type: "boolean",
+    description: "Override the working-set floor guard on BOTH paths \u2014 an explicit content range whose fold leaves less than foldFloorPct of the window visible, and a condense election. Legitimate only for imminent overflow: a shallow working set is where open-weight accuracy collapses (arXiv 2611.05306 Appendix D)."
+  },
+  condense: {
+    type: "object",
+    description: 'Engine-picked fold: the engine elects the LARGEST eligible continuous run of the CURRENT surface (walls: the newest injected instruction copy of every scope, the newest skill catalog, checkpoint carriers, the system node, the active user turn) and folds it in ONE durable replace \u2014 you write the handoff note. Mutually exclusive with content. The note must carry "## Goal" (what the stretch was doing and what remains) and "## Next" (the immediate next command plus the completion condition): a note without them turns one fold into a re-run of the work it replaced. Price: the next request re-prefills every token AFTER the rewrite point ONCE, so the rewrite point IS the lever \u2014 a fold near the tail barely re-reads anything, one near the head re-reads almost everything. Prefer the LATEST consumed stretch, fold in bulk, and do not fold at all when nothing consumed is worth reclaiming.',
+    properties: {
+      summary: { type: "string", required: true, description: "The handoff note replacing the elected stretch. Minimum 50 characters; must carry ## Goal and ## Next. Best shape (arXiv 2611.05306 Appendix G): ## Goal, ## Established facts, ## Applied changes, ## Verification (what you ran, what passed, what failed and the workaround), ## Dead ends (tried and why they failed \u2014 so nobody retries them), ## Remaining plan with the immediate next command AND the completion condition, carried verbatim. Only Goal/Next are enforced; the rest is checked and named as a warning." },
+      topic: { type: "string", description: "Short label (3-5 words) for the folded block." },
+      force: { type: "boolean", description: "Fold even though it leaves less than the working-set floor visible (foldFloorPct of the window). Only for imminent overflow: a shallow working set is where open-weight models lose accuracy." },
+      verifiedReadings: { type: "array", items: { type: "string" }, description: 'Optional: acceptance readings already green before this fold (e.g. "t0-fastpath 8/8").' }
+    },
+    additionalProperties: false
   }
 };
 function parseSeq(value) {
@@ -8437,7 +8840,7 @@ function parseBoundary2(value, byRef, session) {
   return seq;
 }
 function unwrapCompressArgs(args) {
-  if (args.content !== void 0) return args;
+  if (args.content !== void 0 || args.condense !== void 0) return args;
   if (args.arguments === void 0) return null;
   let inner = args.arguments;
   if (typeof inner === "string") {
@@ -8448,9 +8851,13 @@ function unwrapCompressArgs(args) {
     }
   }
   if (typeof inner !== "object" || inner === null || Array.isArray(inner)) return null;
-  const content = inner.content;
-  if (content === void 0) return null;
-  return { ...args, content };
+  const inner2 = inner;
+  if (inner2.content === void 0 && inner2.condense === void 0) return null;
+  return {
+    ...args,
+    content: inner2.content,
+    condense: inner2.condense
+  };
 }
 function unwrapEnvelope(args) {
   const envelope = args.arguments;
@@ -8564,6 +8971,168 @@ function anchorRefForNode(session, byRaw, seq, role) {
   }
   return void 0;
 }
+function pickCondenseSpan(session, turn, preserveRecent, foldPricing, pressure) {
+  const byRaw = turn.state.messageRefs.byRaw;
+  const nodes = session.surface.nodes;
+  let firstSeq;
+  let lastSeq;
+  let refCount = 0;
+  for (const seq of nodes) {
+    if (byRaw[String(seq)] === void 0) continue;
+    refCount += 1;
+    firstSeq ??= seq;
+    lastSeq = seq;
+  }
+  if (firstSeq === void 0 || lastSeq === void 0) {
+    return {
+      reason: "the kernel holds no ref for any of the " + nodes.length + " live surface nodes \u2014 nothing has been projected yet",
+      candidates: []
+    };
+  }
+  const view = {
+    ranges: [{ startRef: byRaw[String(firstSeq)], endRef: byRaw[String(lastSeq)] }],
+    refs: { byRef: turn.state.messageRefs.byRef }
+  };
+  const ranges = buildCompressibleSeqRanges(session, view, {
+    preserveRecent,
+    foldStaleInstructionRows: true,
+    ...foldPricing === void 0 ? {} : { foldPricing }
+  });
+  let best;
+  let bestNet = Number.NEGATIVE_INFINITY;
+  for (const range of ranges) {
+    const net = range.tokens - range.foldCostTokens;
+    if (net > bestNet || net === bestNet && best !== void 0 && range.spills > best.spills) {
+      bestNet = net;
+      best = range;
+    }
+  }
+  if (best === void 0) {
+    return {
+      reason: "no continuous run clears the kernel minimum range (counted in CHARACTERS, compress.minCompressRange) \u2014 " + refCount + " projected nodes, nothing contiguous enough to fold",
+      candidates: ranges.slice(0, 6)
+    };
+  }
+  const relief = pressure !== void 0 && pressure.limitTokens > 0 && pressure.liveTokens >= pressure.limitTokens * CONDENSE_PRESSURE_RELIEF_RATIO;
+  if (best.tokens < MIN_CONDENSE_SPAN_TOKENS) {
+    return {
+      reason: "the largest eligible run is ~" + best.tokens + " tokens, under the " + MIN_CONDENSE_SPAN_TOKENS + "-token floor for a condense handoff: a note that fits the " + Math.round(MAX_NOTE_WEIGHT_RATIO * 100) + "% weight cap on a span this small is a second copy, not a briefing. Keep working so consumed stretches accumulate, or send that span as an explicit content range with a one-line summary \u2014 that path carries no handoff requirement",
+      candidates: ranges.slice(0, 6)
+    };
+  }
+  const noteBudget = condenseNoteBudget(best.tokens, best.foldCostTokens);
+  if (!relief && noteBudget < MIN_HANDOFF_NOTE_TOKENS) {
+    return {
+      reason: [
+        "every eligible row costs MORE to re-prefill (once) than it removes: the best row removes " + best.tokens + " tokens and re-prefills ~" + best.foldCostTokens + " after its rewrite point",
+        "(one-time net " + bestNet + "). A handoff note has to be at least ~" + MIN_HANDOFF_NOTE_TOKENS + " tokens to brief a resumed session, and this row allows a note of only ~" + Math.max(0, noteBudget) + " stored tokens (frame prefix included) inside the " + CONDENSE_PAYBACK_REQUESTS + "-request horizon" + (noteBudget <= 0 ? " \u2014 what it removes never earns the re-prefill back at ANY note size" : "") + ". Send that span as an explicit content range.",
+        "Otherwise stop compressing and keep working: a fold that removes little right in front of a",
+        "big resident summary is a loss. The payback gate steps aside only at \u2265" + Math.round(CONDENSE_PRESSURE_RELIEF_RATIO * 100) + "% of the window (pressure relief, and",
+        "even there only for a fold that reclaims real headroom); the working-set floor and the",
+        "note-weight gate never step aside."
+      ].join(" "),
+      candidates: ranges.slice(0, 6)
+    };
+  }
+  const reliefFloor = reliefMinSavingTokens(relief, pressure?.limitTokens ?? 0);
+  if (relief && !reliefSpanReachable(best.tokens, pressure?.limitTokens ?? 0)) {
+    return {
+      reason: [
+        "pressure relief demands a real reclaim: the best row removes only " + best.tokens + " tokens, and even with the smallest note this tool accepts (~" + SUMMARY_FRAME_TOKENS + " tokens of summary frame prefix) that leaves under ~" + reliefFloor + " tokens of headroom",
+        "(2% of the ~" + (pressure?.limitTokens ?? 0) + "-token window). A fold that saves less spends a",
+        "permanent barrier and a full re-prefill and re-arms the same cliff one step later. Fold a",
+        "bigger stretch \u2014 the nudge range table and acp_status list the eligible rows."
+      ].join(" "),
+      candidates: ranges.slice(0, 6)
+    };
+  }
+  return {
+    start: best.start,
+    end: best.end,
+    count: best.count,
+    tokens: best.tokens,
+    foldCostTokens: best.foldCostTokens,
+    liveAfterFoldTokens: best.liveAfterFoldTokens,
+    belowFloor: best.belowFloor,
+    aboveFloorAvailable: ranges.some((range) => !range.belowFloor),
+    guardedRowCount: guardedSurfaceSeqsOf(session).size,
+    eligibleRangeCount: ranges.length,
+    degraded: false,
+    pressureRelief: relief,
+    reliefLimitTokens: pressure?.limitTokens ?? 0,
+    noteBudgetTokens: relief ? Number.POSITIVE_INFINITY : noteBudget
+  };
+}
+function condenseDegradable(pick, minimum) {
+  return pick.belowFloor && !pick.aboveFloorAvailable && pick.tokens >= minimum;
+}
+function condenseFloorRefusal(pick, floor) {
+  const head = `compress: condense refused seqs ${pick.start}..${pick.end} \u2014 it removes ~${pick.tokens} tokens and leaves only ~${pick.liveAfterFoldTokens}, under the working-set floor ~${floor}.
+`;
+  if (pick.aboveFloorAvailable) {
+    return head + `AN ELIGIBLE ROW STILL LEAVES THE FLOOR: fold THAT row instead. A fold leaves exactly as much room as it does NOT remove, so the widest row is the one that strands the working set. Batch only spans you would fold anyway: a batch pays ONE re-prefill measured from its EARLIEST rewrite point, so folding an early row together with a later one pays the early row's whole suffix (see the foldCost column). Pass force:true only when you accept a shallow working set (e.g. an imminent overflow).`;
+  }
+  if (pick.eligibleRangeCount > 0) {
+    return head + `NO ELIGIBLE ROW LEAVES THE FLOOR: ${pick.eligibleRangeCount} row(s) remain and every one of them ends under ~${floor} tokens, while ${pick.guardedRowCount} row(s) are refused by the guards (current instruction copies, the newest skill catalog, the active user turn). Do NOT widen blindly \u2014 no call can reclaim a guarded row. The engine folds below the floor on its own only when nothing else can keep it, and that is decided from these rows, not from a fold count. Fold nothing for now, or name ONE explicit range with force:true if an overflow is imminent.`;
+  }
+  return head + `NOTHING ELSE IS ELIGIBLE AT ALL: no range clears the kernel minimum, so there is no fold to make here. Do NOT retry \u2014 stop compressing and keep working.`;
+}
+var CONDENSE_GOAL = /(^|\n)\s*(?:#{1,4}|\*{1,3})?\s*[{[【]?\s*(goal|objective|\u4efb\u52a1|\u76ee\u6807)\s*[}\]】]?\s*[:：]?/i;
+var CONDENSE_NEXT = /(^|\n)\s*(?:#{1,4}|\*{1,3})?\s*[{[【]?\s*(next|next step|remaining plan|\u4e0b\u4e00\u6b65|\u5b8c\u6210\u6761\u4ef6|\u5269\u4f59\u8ba1\u5212)\s*[}\]】]?\s*[:：]?/i;
+function missingCondenseHeadings(note) {
+  const missing = [];
+  if (!CONDENSE_GOAL.test(note)) missing.push("## Goal \u2014 what this stretch was doing and what remains");
+  if (!CONDENSE_NEXT.test(note)) missing.push("## Next \u2014 the immediate next command and the completion condition");
+  return missing;
+}
+var CONDENSE_FIELDS = [
+  [/^\s*#{1,3}\s*(objective|goal|\u4efb\u52a1|\u76ee\u6807)/im, "Objective"],
+  [/^\s*#{1,3}\s*(established facts|facts|\u5df2\u786e\u8ba4\u4e8b\u5b9e|\u4e8b\u5b9e)/im, "Established facts"],
+  [/^\s*#{1,3}\s*(applied changes|changes|\u5df2\u505a\u6539\u52a8|\u6539\u52a8)/im, "Applied changes"],
+  [/^\s*#{1,3}\s*(verification|verified|\u9a8c\u8bc1|\u5df2\u9a8c\u8bc1)/im, "Verification"],
+  [/^\s*#{1,3}\s*(dead ends|failed|\u6b7b\u8def|\u5931\u8d25\u5c1d\u8bd5)/im, "Dead ends"],
+  [/^\s*#{1,3}\s*(remaining plan|next|next step|\u8ba1\u5212|\u4e0b\u4e00\u6b65|\u5b8c\u6210\u6761\u4ef6)/im, "Remaining plan"]
+];
+function condenseNoteGaps(note) {
+  return CONDENSE_FIELDS.filter(([pattern]) => !pattern.test(note)).map(([, name]) => name);
+}
+var MAX_NOTE_WEIGHT_RATIO = 0.35;
+var SUMMARY_FRAME_TOKENS = defaultCountTokens(withSummaryFramePrefix("x")) - defaultCountTokens("x");
+var TYPICAL_HANDOFF_NOTE_TOKENS = 900;
+var MIN_CONDENSE_SPAN_TOKENS = Math.ceil(TYPICAL_HANDOFF_NOTE_TOKENS / MAX_NOTE_WEIGHT_RATIO);
+var MIN_HANDOFF_NOTE_TOKENS = 250;
+var RELIEF_MIN_NET_SAVING_RATIO = 0.02;
+var RELIEF_MIN_NET_SAVING_MAX_TOKENS = 2048;
+function reliefMinSavingTokens(pressureRelief, limitTokens) {
+  if (!pressureRelief || limitTokens <= 0) return 0;
+  return Math.min(RELIEF_MIN_NET_SAVING_MAX_TOKENS, Math.max(1, Math.floor(limitTokens * RELIEF_MIN_NET_SAVING_RATIO)));
+}
+var CONDENSE_PAYBACK_REQUESTS = 4;
+function condenseNoteBudget(spanTokens, foldCostTokens) {
+  return Math.floor((CONDENSE_PAYBACK_REQUESTS * spanTokens - foldCostTokens) / (CONDENSE_PAYBACK_REQUESTS + 1));
+}
+function reliefSpanReachable(spanTokens, limitTokens) {
+  return spanTokens - SUMMARY_FRAME_TOKENS >= reliefMinSavingTokens(true, limitTokens);
+}
+var CONDENSE_PRESSURE_RELIEF_RATIO = 0.85;
+function condenseNotePayback(spanTokens, foldCostTokens, noteTokens) {
+  const netSaving = spanTokens - noteTokens;
+  if (netSaving <= 0) return { worth: false, payback: Number.POSITIVE_INFINITY, netSaving };
+  const cost = foldCostTokens + noteTokens;
+  return { worth: cost <= netSaving * CONDENSE_PAYBACK_REQUESTS, payback: Math.ceil(cost / netSaving), netSaving };
+}
+function noteWeightRatio(note, spanTokens, storedTokens) {
+  if (spanTokens <= 0) return Number.POSITIVE_INFINITY;
+  return (storedTokens ?? defaultCountTokens(withSummaryFramePrefix(note))) / spanTokens;
+}
+function noteWeightRejection(note, spanTokens, storedTokens, includesDegradeLine = false) {
+  const tokens = storedTokens ?? defaultCountTokens(withSummaryFramePrefix(note));
+  const ratio = noteWeightRatio(note, spanTokens, tokens);
+  if (!Number.isFinite(ratio)) {
+    return "compress: condense refused \u2014 the elected span holds ~0 tokens, so a note of any size can only ADD resident text.\nNothing lands. Fold a stretch that actually carries consumed work (see the nudge range table or acp_status), or skip the fold.";
+  }
+  return "compress: condense refused \u2014 your note is ~" + Math.round(ratio * 100) + "% of the " + spanTokens + " tokens it replaces (limit " + Math.round(MAX_NOTE_WEIGHT_RATIO * 100) + "%), counted as it is stored (" + tokens + " tokens including the summary frame prefix" + (includesDegradeLine ? " and the [dsh:degraded] line" : "") + ").\nThat is a second copy, not a briefing: it stays resident in every later request, so the fold never pays back its one-time re-prefill.\nCut it to what a resumed session cannot re-derive: ## Goal, Established facts, Applied changes, Verification, Dead ends, Remaining plan (next command + completion condition). Nothing lands \u2014 rewrite the note and send it again.";
+}
 async function handleCompress(env, args, exec) {
   const agent = requireAgent(exec);
   const session = agent.session;
@@ -8585,6 +9154,74 @@ async function handleCompress(env, args, exec) {
     };
   }
   args = unwrapped;
+  let condensePick;
+  if (args.condense !== void 0) {
+    if (args.content !== void 0) {
+      return { text: "compress: condense and content are mutually exclusive \u2014 pass one or the other" };
+    }
+    const note = args.condense.summary ?? "";
+    const missing = missingCondenseHeadings(note);
+    if (missing.length > 0) {
+      return {
+        text: "compress: condense needs a handoff note, not a topical summary \u2014 add " + missing.join(" and ") + ".\nRe-send the SAME condense call with the completed note: the engine re-picks the span from the CURRENT surface, so nothing you wrote is invalidated."
+      };
+    }
+    const liveTokens = Math.max(
+      lastRequestInput(session),
+      surfaceTokens(session) * (pairedInflation(session) ?? DEFAULT_OVERFLOW_INFLATION) + requestOverhead(session)
+    );
+    const pick = pickCondenseSpan(session, turn, 5, foldPricingFor(env), {
+      liveTokens,
+      limitTokens: window.limit
+    });
+    if ("reason" in pick) {
+      const rows = pick.candidates.map(
+        (range) => "  - seq " + range.start + ".." + range.end + " \u2014 " + range.count + " messages, ~" + range.tokens + " tokens \u2014 fold costs ~" + range.foldCostTokens + " once"
+      );
+      return {
+        text: "compress: condense folded nothing \u2014 " + pick.reason + ".\nCompare against the automatic checkpoint it replaces: a host checkpoint costs a fully cold prefill (~130 s here), so waiting is cheaper only while nothing is consumed.\n" + (rows.length > 0 ? "Eligible runs you can fold explicitly:\n" + rows.join("\n") : "No eligible run yet \u2014 keep working; consumed spans reappear in the next nudge.")
+      };
+    }
+    const forced = args.force === true || args.condense.force === true;
+    const floor = foldPricingFor(env).floorTokens ?? 0;
+    let degradedNote = "";
+    let degradedPick;
+    if (pick.belowFloor && !forced) {
+      const minimum = Math.max(MIN_DEGRADED_FOLD_TOKENS, Math.floor(floor / 2));
+      if (!condenseDegradable(pick, minimum)) {
+        return { text: condenseFloorRefusal(pick, floor) };
+      }
+      degradedPick = { ...pick, degraded: true };
+      degradedNote = "\n[dsh:degraded] no eligible row could keep the working-set floor: this fold leaves ~" + pick.liveAfterFoldTokens + " of ~" + floor + " tokens. Provenance of a desperate fold, not a proposal.";
+    }
+    const storedSummary = note + degradedNote;
+    const noteTokens = defaultCountTokens(withSummaryFramePrefix(storedSummary));
+    const weight = noteWeightRatio(note, pick.tokens, noteTokens);
+    if (weight > MAX_NOTE_WEIGHT_RATIO) {
+      return { text: noteWeightRejection(note, pick.tokens, noteTokens, degradedNote !== "") };
+    }
+    const payback = condenseNotePayback(pick.tokens, pick.foldCostTokens, noteTokens);
+    const reliefFloor = reliefMinSavingTokens(pick.pressureRelief, pick.reliefLimitTokens);
+    if (!payback.worth && !(pick.pressureRelief && payback.netSaving >= reliefFloor)) {
+      const horizon = Number.isFinite(payback.payback) ? `Payback needs ~${payback.payback} requests and the horizon is ${CONDENSE_PAYBACK_REQUESTS}. Fold a bigger stretch, write a shorter note, or send the span as an explicit content range when you know this session has longer to run.` : `Nothing is saved at any horizon: a note this size leaves ${payback.netSaving} tokens per request, so NO session length and NO explicit content range makes this fold positive \u2014 the only correct move is a materially shorter note or a bigger stretch.`;
+      const budgetHint = Number.isFinite(pick.noteBudgetTokens) && pick.noteBudgetTokens >= MIN_HANDOFF_NOTE_TOKENS ? ` A note of at most ~${pick.noteBudgetTokens} stored tokens (frame prefix included) still pays back inside ${CONDENSE_PAYBACK_REQUESTS} requests.` : "";
+      const reliefLine = pick.pressureRelief ? ` You are past the relief threshold, but relief still requires a net reclaim of at least ~${reliefFloor} tokens (2% of the window) \u2014 a fold that saves less spends a permanent barrier and a full re-prefill for nothing.` : "";
+      return {
+        text: `condense refused: the note (~${noteTokens} tokens, stored form including the summary frame prefix${degradedNote !== "" ? " and the [dsh:degraded] line" : ""}) stays resident on every later request, so ${payback.netSaving} tokens are really saved against a ~${pick.foldCostTokens}-token re-prefill. ${horizon}${budgetHint}${reliefLine}`
+      };
+    }
+    condensePick = degradedPick ?? pick;
+    args = {
+      ...args,
+      content: [{
+        startSeq: pick.start,
+        endSeq: pick.end,
+        summary: note + degradedNote,
+        topic: args.condense.topic,
+        verifiedReadings: args.condense.verifiedReadings
+      }]
+    };
+  }
   validateContentItems(args.content);
   const ranges = [];
   const alreadyCompressedNotes = [];
@@ -8622,6 +9259,13 @@ async function handleCompress(env, args, exec) {
     const instructionHits = guardedRowsInSpan(guardedSeqs, shadowedSpan);
     if (instructionHits.length > 0) {
       rejectedNotes.push(protectedRowRejectionNote(resolved.start, resolved.end, instructionHits, shadowedSpan, session));
+      continue;
+    }
+    const priced = foldSpanPricing(session, resolved.start, resolved.end, foldPricingFor(env));
+    if (priced.belowFloor && args.force !== true && args.condense?.force !== true && condensePick?.degraded !== true) {
+      rejectedNotes.push(
+        "  seq " + resolved.start + ".." + resolved.end + " would leave ~" + priced.liveAfterTokens + " tokens visible, under the working-set floor ~" + (foldPricingFor(env).floorTokens ?? 0) + " \u2014 one fold costs the SAME single re-prefill, so this span is too thin to earn it back. Do NOT just widen blindly: current instruction copies, the newest skill catalog and the active user turn are refused by a DIFFERENT guard (they appear as their own rejection line when hit), so widen only across rows that stay eligible, or fold several disjoint slices in ONE call. Read consumed bytes back from files instead of folding. force:true bypasses THIS floor only \u2014 never the guarded rows. Other ranges in this batch already landed, so do not resend this one unchanged."
+      );
       continue;
     }
     const startBlockRef = blockRefForSummarySeq(session, resolved.start);
@@ -8754,10 +9398,23 @@ async function handleCompress(env, args, exec) {
       `  block ${compactionId.slice(0, 8)}: seqs ${start}..${end}, ${shadowed.length} messages shadowed${tierLabel2}${readingsLabel}${note}`
     );
   }
+  if (applied.result.blocksCreated > 0) recordCompressCost(session, providerUsage(agent));
   const summaryLine = `Compressed ${applied.result.blocksCreated} block(s), ~${applied.result.tokensCompressed} tokens reclaimed.`;
+  const condenseLine = condensePick === void 0 || applied.result.blocksCreated === 0 ? "" : (() => {
+    const noteTok = defaultCountTokens(withSummaryFramePrefix(args.content?.[0]?.summary ?? ""));
+    const priced = condenseNotePayback(condensePick.tokens, condensePick.foldCostTokens, noteTok);
+    const even = Number.isFinite(priced.payback) ? ` \u2014 it breaks even after ~${priced.payback} further requests` : "";
+    return `  condense elected seqs ${condensePick.start}..${condensePick.end} (~${condensePick.tokens} tokens removed); the next request re-prefills ~${condensePick.foldCostTokens} tokens ONCE \u2014 every token AFTER the rewrite point, because the fixed request head (system prompt, tool registry) sits BEFORE it and a warm cache reuses it (an injected row that landed AFTER the rewrite point is inside this price, not reused) \u2014 and this note (~${noteTok} tokens) stays resident on every request after it, saving ~${priced.netSaving} each${even}.
+  Batching spans into ONE call pays a single re-prefill, measured from the EARLIEST rewrite point of that batch; splitting them across calls pays one re-prefill each, so batch only what you would fold anyway \u2014 folding an early span to reach a later one pays the early span's whole suffix.`;
+  })();
   const totalSkipped = skippedRanges + alreadyCompressedNotes.length + duplicateRangeNotes.length + rejectedNotes.length;
   const failedLines = applied.result.errors.map((error) => `  ${error}`);
+  const condenseAdvisories = condensePick === void 0 || applied.result.blocksCreated === 0 ? [] : [
+    ...condenseNoteGaps(args.condense?.summary ?? "").length > 0 ? ["  condense note is missing Appendix G field(s): " + condenseNoteGaps(args.condense?.summary ?? "").join(", ") + " \u2014 Verification and Dead ends are the ones a resumed session re-derives most expensively."] : [],
+    ...condensePick?.degraded === true ? ["  DEGRADED election: no eligible row could keep the working-set floor, so this fold went below it on purpose. The STORED note carries the [dsh:degraded] line \u2014 that line is the single source; this line only quotes it so you know now, in this turn, instead of discovering it after the next re-prefill."] : []
+  ];
   const warningLines = [
+    ...condenseAdvisories,
     ...freeWarnings.map((warning) => `  ${warning}`),
     ...failedLines,
     ...alreadyCompressedNotes,
@@ -8768,7 +9425,7 @@ async function handleCompress(env, args, exec) {
   ];
   const footer = totalSkipped > 0 ? `  (${totalSkipped} range(s) skipped or failed \u2014 see above)` : "";
   return { text: `${summaryLine}
-${[...warningLines, footer].filter((line) => line !== "").join("\n")}` };
+${[...warningLines, condenseLine, footer].filter((line) => line !== "").join("\n")}` };
 }
 var decompressParameters = {
   blockId: { type: "string", required: true, description: "Block id: the kernel block ref `bN` shown by acp_status (e.g. b1), or a compaction id / prefix from search_context." },
@@ -8778,6 +9435,7 @@ var decompressParameters = {
 function resolveBlockId(session, arg) {
   const byKernelRef = blockIdOfKernelRef(session, arg);
   if (byKernelRef !== null) return byKernelRef;
+  if (/^b\d+$/.test(arg)) return null;
   const ledger = rebuildBlockLedger(sessionEventsOf(session));
   const byPrefix = ledger.find((entry) => entry.blockId.startsWith(arg));
   return byPrefix?.blockId ?? null;
@@ -8968,6 +9626,31 @@ async function handleStatus(env, rawArgs, exec) {
         "Note: the pressure line is provider-anchored (images/files priced by the live route); the breakdown above is a text-only estimate. They can differ on media-heavy sessions."
       );
     }
+  }
+  const usage = providerUsage(agent);
+  if (usage !== void 0) {
+    lines.push(
+      "",
+      `Provider usage (cumulative): ${usage.uncachedInputTokens} uncached input | ${usage.cacheReadTokens} cache read | ${usage.cacheWriteTokens} cache write | ${usage.outputTokens} output`
+    );
+    lines.push("", `Total request input: ${totalRequestInput(usage)}`);
+  }
+  const live = lastRequestInput(session);
+  const peak = peakRequestInput(session);
+  const contextLimit = env.windowFor !== void 0 ? (await env.windowFor(agent)).limit : env.modelContextLimit;
+  const sizeParts = [];
+  if (live > 0) sizeParts.push(`live ${live}`);
+  if (peak > 0) sizeParts.push(`peak ${peak}`);
+  const folds = rebuildBlockLedger(sessionEventsOf(session)).length;
+  if (folds > 0) {
+    lines.push("", `Fold barriers: ${folds} (each splits the surface and can never be folded again) \u2014 fewer, larger folds preserve room for later folds`);
+  }
+  if (contextLimit > 0 && live > 0) sizeParts.push(`window ${contextLimit}`, `room ${Math.max(0, contextLimit - live)}`);
+  if (sizeParts.length > 0) lines.push("", `Request input sizes: ${sizeParts.join(" | ")}`);
+  const floorTokens = foldPricingFor({ ...env, modelContextLimit: contextLimit }).floorTokens;
+  if (floorTokens !== void 0 && floorTokens > 0) {
+    const close = live > 0 && live < floorTokens * 2;
+    lines.push("", `Fold floor: a fold must leave at least ~${floorTokens} live tokens, below which compress and condense both refuse${live > 0 ? ` (live is ${live}${close ? " \u2014 close to the floor: a fold leaves exactly the room it does NOT remove, so the SMALLER span is the one that stays above the floor; better still, stop compressing" : ""})` : ""}`);
   }
   lines.push("", `Surface: ${surfaceSummary(session)}`);
   if (args.scope === "uncompressed") {
@@ -9498,6 +10181,9 @@ var ACP_SYSTEM_PROMPT = renderSystemPrompt(DEFAULT_PROMPTS);
 var ACP_SYSTEM_PROMPT_ORDER = 150;
 
 // src/index.ts
+var MIN_OVERFLOW_FOLD_TOKENS = 4096;
+var OVERFLOW_FOLD_WINDOW_RATIO = 0.1;
+var OVERFLOW_FOLD_PASSES = 3;
 var DEFAULT_CONFIG = {
   autoModelContextLimit: true,
   autoTools: true,
@@ -9783,7 +10469,11 @@ var AcpCompactionEngine = class _AcpCompactionEngine extends CompactionEngine {
       });
     });
     ctx.on("agent/pre-step", async (payload, next) => {
+      pruneStaleNudgeRows(payload.agent.session);
       stripOrphanedSurfaceToolMessages(payload.agent.session);
+      setCalibrationRoute(payload.agent.session, `${routeFor(payload.agent).provider}/${routeFor(payload.agent).model}`);
+      const billed = lastRequestUsage(payload.agent.session);
+      calibrateRequestPair(payload.agent.session, billed?.tokens ?? 0, billed?.seq ?? 0, surfaceTokens(payload.agent.session));
       engine.resyncSettings();
       const style = engine.resolveToolCallStyle(payload.agent.session);
       if (style !== engine.appliedStyle) engine.applyToolCallStyle(style);
@@ -9796,6 +10486,7 @@ var AcpCompactionEngine = class _AcpCompactionEngine extends CompactionEngine {
       if (!engine.readSettingsSource().autoNudge) return next();
       const decision = await next();
       if (decision.kind === "reject") return decision;
+      if (openToolCallIds(payload.agent.session).size > 0) return decision;
       const window = await this.windowFor(payload.agent);
       const outcome = buildNudge(
         payload.agent,
@@ -10076,66 +10767,116 @@ var AcpCompactionEngine = class _AcpCompactionEngine extends CompactionEngine {
   async compactForOverflow(agent, signal) {
     signal.throwIfAborted();
     const session = agent.session;
-    const state = this.store.stateFor(session);
-    const coreMessages = allLogMessages(session);
     const surfaceMessages = eventsToCoreMessages(surfaceEventsOf(session));
     const tokenCount = resolveTokenCount(agent, surfaceMessages);
     const window = await this.windowFor(agent);
     const config = kernelConfigFor({ ...this.env, modelContextLimit: window.limit });
-    const turn = this.kernel.processTurn({ messages: coreMessages, state, config, tokenCount, renderTags: "none" });
-    this.store.set(session, turn.state);
-    const byRaw = turn.state.messageRefs.byRaw;
-    let firstSeq;
-    let lastSeq;
-    for (const seq of session.surface.nodes) {
-      if (byRaw[String(seq)] === void 0) continue;
-      firstSeq ??= seq;
-      lastSeq = seq;
-    }
-    if (firstSeq === void 0 || lastSeq === void 0) return null;
-    const view = {
-      ranges: [{ startRef: byRaw[String(firstSeq)], endRef: byRaw[String(lastSeq)] }],
-      refs: { byRef: turn.state.messageRefs.byRef }
+    const foldPricing = foldPricingFor(this.env);
+    const minimumFold = Math.min(
+      MIN_OVERFLOW_FOLD_TOKENS,
+      Math.max(1, Math.floor(window.limit * OVERFLOW_FOLD_WINDOW_RATIO))
+    );
+    const foldPass = (pass) => {
+      const messages = allLogMessages(session);
+      const passTurn = this.kernel.processTurn({ messages, state: this.store.stateFor(session), config, tokenCount, renderTags: "none" });
+      const stateNow = passTurn.state;
+      this.store.set(session, stateNow);
+      const byRaw = stateNow.messageRefs.byRaw;
+      let firstSeq;
+      let lastSeq;
+      for (const seq of session.surface.nodes) {
+        if (byRaw[String(seq)] === void 0) continue;
+        firstSeq ??= seq;
+        lastSeq = seq;
+      }
+      if (firstSeq === void 0 || lastSeq === void 0) return { record: null, fitRisk: false, liveAfterTokens: 0, remainingReclaimTokens: 0, inflation: DEFAULT_OVERFLOW_INFLATION, overhead: 0 };
+      const view = {
+        ranges: [{ startRef: byRaw[String(firstSeq)], endRef: byRaw[String(lastSeq)] }],
+        refs: { byRef: stateNow.messageRefs.byRef }
+      };
+      const ranges = buildCompressibleSeqRanges(session, view, {
+        preserveRecent: 5,
+        mediaPriceOf: meterMediaPriceResolver(agent, session),
+        foldPricing
+      });
+      if (ranges.length === 0) return { record: null, fitRisk: false, liveAfterTokens: 0, remainingReclaimTokens: 0, inflation: DEFAULT_OVERFLOW_INFLATION, overhead: 0 };
+      const aboveFloor = ranges.filter((range) => !range.belowFloor);
+      const pool = aboveFloor.length > 0 ? aboveFloor : ranges;
+      const best = pool.reduce((largest, range) => range.tokens > largest.tokens ? range : largest);
+      if (best.tokens < minimumFold) return { record: null, fitRisk: false, liveAfterTokens: 0, remainingReclaimTokens: 0, inflation: DEFAULT_OVERFLOW_INFLATION, overhead: 0 };
+      const priced = foldSpanPricing(session, best.start, best.end, foldPricing);
+      const paired = pairedInflation(session);
+      const inflation = paired ?? DEFAULT_OVERFLOW_INFLATION;
+      const overhead = requestOverhead(session);
+      const projected = priced.liveAfterTokens * inflation + overhead;
+      const fitRisk = projected > window.limit;
+      if (fitRisk) {
+        this.ctx.logger.warn(
+          `billion-context-dsh: overflow fold pass ${pass} proceeds with a FIT RISK \u2014 projected ${Math.round(projected)} > window ${window.limit} (liveAfter ${priced.liveAfterTokens}, overhead ${overhead}, inflation ${inflation.toFixed(2)}, ${paired === void 0 ? String(DEFAULT_OVERFLOW_INFLATION) + " fallback" : "paired sample"})`
+        );
+      }
+      const provenanceParts = [];
+      if (priced.belowFloor) {
+        provenanceParts.push(`below-floor emergency fold: floor ~${foldPricing.floorTokens ?? 0}, folded ~${priced.spanTokens}, live-after ~${priced.liveAfterTokens}, window ${window.limit}, reason overflow-no-above-floor`);
+      }
+      if (fitRisk) {
+        provenanceParts.push(`FIT RISK when folding: projected ~${Math.round(projected)} > window ${window.limit}, live-after ~${priced.liveAfterTokens}, overhead ${overhead}, inflation ${inflation.toFixed(2)}, ${paired === void 0 ? String(DEFAULT_OVERFLOW_INFLATION) + " fallback" : "paired sample"}`);
+      }
+      const provenance = provenanceParts.length > 0 ? provenanceParts.join("; ") : void 0;
+      const startRef = byRaw[String(best.start)];
+      const endRef = byRaw[String(best.end)];
+      if (startRef === void 0 || endRef === void 0) return { record: null, fitRisk: false, liveAfterTokens: 0, remainingReclaimTokens: 0, inflation: DEFAULT_OVERFLOW_INFLATION, overhead: 0 };
+      const summary = overflowMarkerSummary(best.count, provenance);
+      const applied = this.kernel.applyCompression({
+        ranges: [{ startRef, endRef, summary, topic: "context-overflow recovery" }],
+        messages,
+        state: stateNow,
+        config
+      });
+      if (applied.result.blocksCreated === 0) return { record: null, fitRisk: false, liveAfterTokens: 0, remainingReclaimTokens: 0, inflation: DEFAULT_OVERFLOW_INFLATION, overhead: 0 };
+      const previousIds = new Set(stateNow.blocks.map((block) => block.blockId));
+      const created = applied.state.blocks.find((block) => !previousIds.has(block.blockId));
+      if (created === void 0) return { record: null, fitRisk: false, liveAfterTokens: 0, remainingReclaimTokens: 0, inflation: DEFAULT_OVERFLOW_INFLATION, overhead: 0 };
+      const shadowed = shadowedSeqsOf(session, best.start, best.end);
+      if (shadowed.length === 0) return { record: null, fitRisk: false, liveAfterTokens: 0, remainingReclaimTokens: 0, inflation: DEFAULT_OVERFLOW_INFLATION, overhead: 0 };
+      const shadowedTokenCount = shadowedTokensViaMeter(session, shadowed, agent.ctx);
+      const { provider, model } = routeFor(agent);
+      runCompactionTransaction(session, {
+        start: best.start,
+        end: best.end,
+        shadowedSeqs: shadowed,
+        summary: [{ type: "text", text: summary }],
+        shadowedTokenCount,
+        provider,
+        model,
+        topic: "context-overflow recovery",
+        kernelBlockId: created.blockId,
+        directMessageIds: created.directMessageIds,
+        effectiveMessageIds: created.effectiveMessageIds
+      });
+      this.store.set(session, applied.state);
+      const remainingReclaim = ranges.filter((range) => range !== best && range.tokens >= minimumFold).reduce((sum, range) => sum + range.tokens, 0);
+      return {
+        record: { start: best.start, end: best.end, shadowedSeqs: shadowed, shadowedTokenCount },
+        fitRisk,
+        liveAfterTokens: priced.liveAfterTokens,
+        remainingReclaimTokens: remainingReclaim,
+        inflation,
+        overhead
+      };
     };
-    const ranges = buildCompressibleSeqRanges(session, view, {
-      preserveRecent: 5,
-      mediaPriceOf: meterMediaPriceResolver(agent, session)
-    });
-    if (ranges.length === 0) return null;
-    const best = ranges.reduce((largest, range) => range.tokens > largest.tokens ? range : largest);
-    const startRef = byRaw[String(best.start)];
-    const endRef = byRaw[String(best.end)];
-    if (startRef === void 0 || endRef === void 0) return null;
-    const summary = overflowMarkerSummary(best.count);
-    const applied = this.kernel.applyCompression({
-      ranges: [{ startRef, endRef, summary, topic: "context-overflow recovery" }],
-      messages: coreMessages,
-      state: turn.state,
-      config
-    });
-    if (applied.result.blocksCreated === 0) return null;
-    this.store.set(session, applied.state);
-    const previousIds = new Set(turn.state.blocks.map((block) => block.blockId));
-    const created = applied.state.blocks.find((block) => !previousIds.has(block.blockId));
-    if (created === void 0) return null;
-    const shadowed = shadowedSeqsOf(session, best.start, best.end);
-    if (shadowed.length === 0) return null;
-    const shadowedTokenCount = shadowedTokensViaMeter(session, shadowed, agent.ctx);
-    const { provider, model } = routeFor(agent);
-    runCompactionTransaction(session, {
-      start: best.start,
-      end: best.end,
-      shadowedSeqs: shadowed,
-      summary: [{ type: "text", text: summary }],
-      shadowedTokenCount,
-      provider,
-      model,
-      topic: "context-overflow recovery",
-      kernelBlockId: created.blockId,
-      directMessageIds: created.directMessageIds,
-      effectiveMessageIds: created.effectiveMessageIds
-    });
-    return { start: best.start, end: best.end, shadowedSeqs: shadowed, shadowedTokenCount };
+    const overheadBlocksFit = requestOverhead(session) >= window.limit;
+    let recovered = null;
+    for (let pass = 0; pass < OVERFLOW_FOLD_PASSES; pass += 1) {
+      const outcome = foldPass(pass);
+      if (outcome.record === null) break;
+      recovered ??= outcome.record;
+      if (!outcome.fitRisk) break;
+      if (overheadBlocksFit) break;
+      if ((outcome.liveAfterTokens - outcome.remainingReclaimTokens) * outcome.inflation + outcome.overhead > window.limit) break;
+    }
+    if (recovered !== null) setCalibrationAnchor(session, surfaceTokens(session));
+    return recovered;
   }
   /** ACP is model-driven: automatic pressure policy never summarizes by itself. */
   async compactIfNeeded(_agent, _trigger, signal) {

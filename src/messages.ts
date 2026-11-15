@@ -472,8 +472,8 @@ const SPILL_KEY = /^(?:stdout|stderr)?[Ss]pillPaths?$/
  * `[output truncated; full output: <path>]`, and the harness omission notice (its wording comes
  * from `dsh-spill-policy/lib/index.js:9` `LOCATION`) appends
  * `(Omitted <N> bytes. Full formatted result stored at: <path>. Use read …)`. Measured
- * 2026-11-15 on the live session: seq 3157 and seq 3220 (a 3 MB bash stdout each) carry BOTH
- * sentences and no JSON key at all, so the key probe below marked zero rows — every row the
+ * 2026-11-15 on the live host: the two largest bash stdouts of that session (3 MB each)
+ * carried BOTH sentences and no JSON key at all, so the key probe below marked zero rows — every row the
  * prompt tells the model to fold first stayed unmarked (round-15 review Q1).
  *
  * Two gates keep a row that merely QUOTES the notice from being marked (grep over the host's own
@@ -481,7 +481,7 @@ const SPILL_KEY = /^(?:stdout|stderr)?[Ss]pillPaths?$/
  * must sit inside one of these directories — the host source interpolates `${spillPath}` and
  * never prints a concrete spill path, so a grep hit cannot match.
  */
-const SPILL_PROSE_DIR = /^\/[^\s)\]"'`]*\/dsh-(?:spill|subprocess)-[^/\s\]"'`…]+\/[^\s\]"'`…]+$/
+const SPILL_PROSE_DIR = /^\/[^\s)\]"'`]*\/dsh-(?:spill|subprocess)-[^/\s)\]"'`…*]+\/[^\s)\]"'`…*]+$/
 
 function collectSpillProse(text: string, out: Set<string>): void {
   // `]` is excluded too: a path followed by another bracketed marker with no space would
@@ -489,16 +489,14 @@ function collectSpillProse(text: string, out: Set<string>): void {
   for (const match of text.matchAll(/\[output truncated; full output: (\/[^\s)\]"'`]+)\]/g)) {
     if (SPILL_PROSE_DIR.test(match[1]!)) out.add(match[1]!)
   }
-  // The stored-result sentence ends with its own advice (`. Use read with offset/limit, or grep
-  // this path …`), so the path is the first whitespace-delimited token and the sentence must be
-  // matched with a trailing `)` — a truncated `Omitted` fragment without the closing brace is not
-  // evidence the bytes reached a file.
   // The notice continues past the path with a period and its own advice (`. Use read with
-  // offset/limit, or grep this path to search within it.)`), so the capture is greedy and the
-  // trailing period is trimmed: a lazy capture either drops the advice clause or returns a
-  // file name ending in ".".
-  for (const match of text.matchAll(/\(Omitted \d+ bytes\. Full formatted result stored at: (\/[^\s)]+)[^)]*\)/g)) {
-    const path = match[1]!.replace(/\.$/, '')
+  // offset/limit, or grep this path to search within it.)`). Anchoring the capture on the suffix the
+  // host actually writes (`<id>-stdout.log`, `<id>-bash.txt`) does two jobs: it stops before the
+  // advice instead of swallowing its trailing period, and it refuses a path cut short at a `)` — a
+  // bare `[^\s)]+` capture reads `/tmp/dsh-spill-1/odd).txt` as `/tmp/dsh-spill-1/odd`, which passes
+  // the directory test and marks the row for a file that was never written (round-17 review Q6).
+  for (const match of text.matchAll(/\(Omitted \d+ bytes\. Full formatted result stored at: (\/[^\s()]+?\.(?:log|txt))[^)]*\)/g)) {
+    const path = match[1]!
     if (SPILL_PROSE_DIR.test(path)) out.add(path)
   }
 }

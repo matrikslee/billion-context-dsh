@@ -216,6 +216,42 @@ export interface SeqCompressibleRange {
     readonly images: number;
     /** File blocks reachable inside the span. */
     readonly files: number;
+    /**
+     * Tokens that stay visible when this row is folded (`live surface − span`).
+     * With a fold floor configured, a row leaving LESS than that floor is
+     * `belowFloor`: folding it strands the model in the shallow-working-set regime
+     * where the paper's open-weight models collapsed (Appendix D).
+     */
+    readonly liveAfterFoldTokens: number;
+    /** True when `floorTokens` is configured and this row would land under it. */
+    readonly belowFloor: boolean;
+    /**
+     * Tool results inside the span whose overflow the host spilled to a FILE.
+     * The bytes are already out of the context and still readable from disk, so
+     * this span is recoverable after folding — the strongest fold-safety signal
+     * the surface has (see spillPathsOfEvent, src/messages.ts).
+     */
+    readonly spills: number;
+    /**
+     * Tokens the NEXT request must re-prefill ONCE after this replace lands.
+     *
+     * Everything AFTER the rewrite point and NOTHING else — the fixed request head
+     * (system prompt, tool registry) sits BEFORE every rewrite point, so a warm
+     * cache reuses it and adding the paired overhead double-counted it (rule 3 B1).
+     * Measured 2026-11-15 on the live host with a
+     * real condense: prompt 125,665, reused 31,378 — the slot reuses the prompt
+     * prefix only up to where the replace landed, and 31,378 is NOT a multiple of
+     * the 2^14 KV block. (The earlier rule, written from 2026-11-14 data where
+     * reused happened to read 16384/32768 three times, claimed a constant reuse
+     * floor and priced 33,722 for a fold that actually re-prefilled 94,287 — a
+     * 2.8x under-quote.)
+     *
+     * So the rewrite point IS a lever: a fold EARLIER in the surface re-prefills
+     * more. Folding a span still removes those bytes from EVERY later request,
+     * which is the saving side. The note the model writes is extra and resident on
+     * every later request. See AGENTS.md rule 3.
+     */
+    readonly foldCostTokens: number;
 }
 /**
  * Per-seq provider-anchored price for non-text blocks (see `mediaPriceViaMeter`
@@ -224,6 +260,64 @@ export interface SeqCompressibleRange {
  * carry an image/file block.
  */
 export type MediaPriceOf = (seq: number) => number;
+/**
+ * One KV block on THIS engine, measured 2026-11-14 as a recurring `reused` value.
+ * It is used ONLY as the working-set floor ceiling below. Measured 2026-11-15
+ * (reused 31,378 after a fold) post-fold reuse is the rewrite point's offset and
+ * is NOT block-aligned, so nothing subtracts this from a fold price any more.
+ */
+export declare const KV_BLOCK_TOKENS = 16384;
+/**
+ * How much of the window must stay LIVE after a fold.
+ *
+ * arXiv 2611.05306 Appendix D, the open-weight band: at a 16K/12K regime the
+ * same tasks fell Qwen 3 Coder Next 53.0 → 3.6, Gemma 4 31B 65.2 → 58.0,
+ * Step 3.7 Flash 70.0 → 56.6, and EVERY model lost — the diagnosis is not the
+ * summary quality but "not enough room to make progress between compactions".
+ * This machine is exactly that class (open weights, verbose trajectories, one
+ * KV slot), so a fold that leaves a shallow working set is the failure mode the
+ * paper measured. The floor costs nothing per fold — it only forbids folding the
+ * widest rows — and buys the headroom the paper says open-weight models need.
+ * Fraction of the effective window; 0 disables.
+ */
+export declare const DEFAULT_FOLD_FLOOR_PCT = 0.15;
+/**
+ * The floor is a GUARD, not an aspiration: it only bites when there was room
+ * to keep. A surface already smaller than the floor cannot satisfy it through any
+ * fold, so guarding there rejects every compress on a short session instead of
+ * protecting a working set (a `?? 0` slip turning every range into belowFloor is
+ * the footgun this predicate exists to close).
+ */
+export declare function belowWorkingSetFloor(totalTokens: number, liveAfterTokens: number, floor?: number): boolean;
+/**
+ * Price an EXPLICIT span with the same implementation the range table uses
+ * (`surfaceSuffixTokens` through the identical `nodePriceOf`), so the guard on a
+ * model-named range cannot disagree with the `below floor` mark on an offered row
+ * (rule 3: one price implementation). Returns belowFloor:false when no floor is
+ * configured — never a false reject on a `?? 0` slip.
+ */
+export declare function foldSpanPricing(session: Session, startSeq: number, endSeq: number, pricing?: FoldPricing): {
+    readonly spanTokens: number;
+    readonly liveAfterTokens: number;
+    readonly belowFloor: boolean;
+};
+/** Fold pricing inputs, threaded as ONE object so the render chain carries one slot. */
+export interface FoldPricing {
+    /**
+     * Fixed tokens the request carries OUTSIDE the counted surface — system prompt,
+     * tool registry, injected instruction copies. Measured 2026-11-15 on the live
+     * host: a fold's real re-prefill is every prompt token AFTER the rewrite point,
+     * and the fixed head sits BEFORE the rewrite point — inside the reused prefix —
+     * so it is NOT added to the fold price (round-10 review B1). It stays in the
+     * EMERGENCY fit check, which asks about the post-fold live size instead.
+     */
+    /**
+     * Minimum tokens that must remain live after the fold (window × foldFloorPct).
+     * A row under it is flagged, and `condense` refuses it unless forced.
+     */
+    readonly floorTokens?: number;
+}
+export declare function surfaceSuffixTokens(session: Session, mediaPriceOf?: MediaPriceOf): number[];
 /**
  * Durable model-free prune: append `compaction/prune` as the shadow price,
  * then replace the given surface seqs with a user message. dsh-session 0.1.5+
@@ -313,6 +407,32 @@ export declare function newestInstructionSeqsOf(session: Session): Set<number>;
  */
 export declare function newestSkillCatalogSeqOf(session: Session): number | null;
 /**
+ * Instruction rows the host CANNOT bring back: every injected copy except the
+ * newest of its scope, plus every superseded skill-catalog row. Folding one while
+ * its newest copy stays visible is real reclamation, not loop fuel -
+ * guardedSurfaceSeqsOf pins exactly the newest copies for that reason. A row with
+ * no changes[] counts as stale too: with no scope the host presence gate cannot
+ * identify a file for it, so it can never be re-sent.
+ *
+ * EVIDENCE for the claim (rule 16, live-measured, not assumed): folding the
+ * NEWEST copy re-triggered an injection within 7 events in 20 of 43 compressions
+ * in a long session (the oldest injected copy, folded near the head, came back tens of
+ * thousands of events later); folding a
+ * superseded copy while the newest stayed visible produced no re-send. If a future
+ * host ever re-emits an older copy, this becomes a silent deletion of a live
+ * instruction with no error to notice — the fallback then is to offer no
+ * foldable instruction rows at all (return an empty set), not to keep folding.
+ *
+ * Only an explicit caller opts in (foldStaleInstructionRows, used by condense).
+ * The nudge range table never does: a stale copy stays a WALL there, so a span the
+ * model names can never reach across policy rows it might still need.
+ */
+export declare function staleInstructionRowsOf(session: Session): Set<number>;
+/** Text left in place of a pruned nudge row (same shape as `PRUNE_NOTE`). */
+export declare const STALE_NUDGE_NOTE = "(superseded pressure nudge \u2014 the newest nudge carries the live seqs)";
+export declare function staleNudgeRowsOf(session: Session, preserve?: number): number[];
+export declare function pruneStaleNudgeRows(session: Session, preserve?: number): number;
+/**
  * Surface seqs NO caller may compress: the CURRENT (newest) injected
  * agent-instructions row of every scope (restricted to rows still visible on
  * the surface — one definition of "current" — `newestInstructionSeqsOf`) PLUS
@@ -389,6 +509,8 @@ export interface KernelRangeView {
 export declare function buildCompressibleSeqRanges(session: Session, kernelView: KernelRangeView, opts?: {
     preserveRecent?: number;
     mediaPriceOf?: MediaPriceOf;
+    foldStaleInstructionRows?: boolean;
+    foldPricing?: FoldPricing;
 }): SeqCompressibleRange[];
 /**
  * A compact human-readable description of the current surface for the model:
@@ -399,6 +521,12 @@ export declare function buildCompressibleSeqRanges(session: Session, kernelView:
  * nudge's range table both surface this so compress edges can be located
  * without blind probing.
  */
+/**
+ * Tokens visible on the surface right now, priced by the SAME implementation as
+ * the range rows (so a refusal and an offer cannot disagree). Used to calibrate
+ * the local estimate against the provider-billed input (src/index.ts fit check).
+ */
+export declare function surfaceTokens(session: Session): number;
 export declare function surfaceSummary(session: Session): string;
 /** One block as seen by the tier machinery: durable id ↔ kernel ref (`bN`). */
 export interface AcpBlockRegistryEntry {

@@ -101,7 +101,7 @@ test('the rewrite point IS a lever: an earlier fold is priced dearer', () => {
 // The fixed request head (system prompt, tool registry, injected rows) sits BEFORE any
 // rewrite point, so a warm cache reuses it — charging it per fold double-counted it
 // and inflated the payback gate (round-10 review B1). Measured the same day: folds at
-// rewrite points 17928 and 18137 billed 51,122 uncached tokens in total afterwards
+// two folds at different rewrite points billed 51,122 uncached tokens in total afterwards
 // while the range table quoted ~92K for a row on that same surface.
 test('the fold price is the suffix only — the fixed request head is not added', () => {
   const session = threeSegmentSession('fold-overhead')

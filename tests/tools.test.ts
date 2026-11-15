@@ -1279,7 +1279,7 @@ test('M3: compress remaps a stale range to the still-live remainder', async () =
   } as never, fakeExec(session))
 
   // Reuse a stale nudge-style range whose START was shadowed by the block
-  // above (the "seq 93148..174600 not in the current surface" class of bug).
+  // above (the "stale kernel range refs are not in the current surface" class of bug).
   // The tool must remap it to the live remainder instead of erroring.
   const result = await compress.execute({
     content: [{

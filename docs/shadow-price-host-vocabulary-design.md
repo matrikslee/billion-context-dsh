@@ -4,7 +4,7 @@
 
 ## 1. 事故背景（issue #54）
 
-session `session-3aa366c3`（Obsidian 面试笔记，中文密集）在两次 `compress` 后**永久卡死**：宿主 token-meter 的 `contextBreakdown` 投影把 `messageTokens` 累成负数（≈ −31K），投影 schema（`zod` `nonnegative`）拒绝每一轮 → `{"code":"too_small","path":["messageTokens"],"message":"Too small: expected number to be >=0"}`，重试无效。
+session `the bricked session`（Obsidian 面试笔记，中文密集）在两次 `compress` 后**永久卡死**：宿主 token-meter 的 `contextBreakdown` 投影把 `messageTokens` 累成负数（≈ −31K），投影 schema（`zod` `nonnegative`）拒绝每一轮 → `{"code":"too_small","path":["messageTokens"],"message":"Too small: expected number to be >=0"}`，重试无效。
 
 根因：引擎把 `compaction/summary`/`compaction/prune` 事件的 `shadowedTokenCount`（影子价格）用 `defaultCountTokens`（CJK 1 字符/token）计价，而宿主账本按扁平 4 字符/token 记账。中文内容下 claim 虚报 ~4 倍：宿主累计 42,076，claim 共 74,858 → 账本被扣穿。
 
@@ -82,4 +82,4 @@ const claim = seqs.reduce((sum, seq) => sum + bySeq.get(seq)!, 0)
 
 - **宿主扁平 4 字符/token 对 CJK 占用率低估 ~4×**（占用率显示不准是宿主既有问题）：治本 = 向 deepseek-harness 提议 `dsh-token-meter` 改 CJK-aware（或可配置系数）。宿主采纳后：占用率显示变准、插件准确性数字与宿主词汇天然一致、镜像可删除。
 - **宿主估算器未从包导出**（`estimateContent`/`estimateMessage` 在 `lib/types/estimate.js`，但 `package.json` exports 只有 `.`/`./invariant`/`./client`/`./src/*`）：镜像是对此的临时绕行。宿主导出后：删镜像、用导出实现对拍 `meter.estimateMessage`（UPSTREAM 追踪行见 docs/dsh-porting-verification.md）。
-- 事故 session 抢救：`scripts/rescue-shadow-price.mjs`（改 claim 为镜像价 + 备份 + 默认 dry-run + `--force`）；`session-3aa366c3` 已抢救（64722→30604、10054→7836、82→1731；fold −30,822 → +3,865，全程最小 +183）。
+- 事故 session 抢救：`scripts/rescue-shadow-price.mjs`（改 claim 为镜像价 + 备份 + 默认 dry-run + `--force`）；`the bricked session` 已抢救（64722→30604、10054→7836、82→1731；fold −30,822 → +3,865，全程最小 +183）。

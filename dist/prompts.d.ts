@@ -36,13 +36,15 @@ export interface NudgePrompts {
     growth: string;
     /** 溢出提示。无占位符 */
     tip: string;
+    /** 压缩后的前缀重读代价。占位符:{uncached} {count} */
+    cacheCost: string;
 }
 export interface RangeTablePrompts {
     /** 表头。占位符:{surface} */
     header: string;
     /** 标题。占位符:{count}(表格行数) */
     title: string;
-    /** 每行。占位符:{start} {end} {count} {tokens} */
+    /** 每行。占位符:{start} {end} {count} {tokens} {toolPct} {textPct} {media} {foldCost} */
     line: string;
     /** 表尾调用语法。无占位符 */
     footer: string;

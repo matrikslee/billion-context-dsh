@@ -7,7 +7,7 @@
  * `shadowedTokenCount` claim to be derived from the SAME estimator. Writing
  * claims with the engine's CJK-aware `defaultCountTokens` overdraws the meter
  * on CJK-heavy sessions and permanently bricks them (live session
- * `session-3aa366c3`, issue #54; AGENTS.md rule 12 — `defaultCountTokens` is
+ * `the bricked session`, issue #54; AGENTS.md rule 12 — `defaultCountTokens` is
  * display currency, NEVER event currency).
  *
  * This module prices claims in the host's vocabulary: it prefers the live

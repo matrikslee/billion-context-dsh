@@ -156,11 +156,13 @@ test('an undelimited wrapper and a decorated header quoting the key claim nothin
 })
 
 // ── round-15 review Q1/Q2: the host writes spills as PROSE on its hottest tools ────
-// Verbatim tail of two live bash results (seq 3157 / seq 3220, each a 3 MB stdout), measured
-// 2026-11-15: BOTH sentences, no JSON key at all. The key probe alone marked zero rows.
+// The tail SHAPE of two live bash results (each a 3 MB stdout), measured 2026-11-15: BOTH
+// sentences, no JSON key at all, so the key probe alone marked zero rows. The names below are
+// SYNTHETIC — the same shape the host writes (`dsh-subprocess-<6 chars>`, `dsh-spill-<6 chars>`, a
+// session id, a 12-char file stem) — not a path from any real machine.
 const PROSE_TAIL =
-  'work line 1\nwork line 2\n\n[output truncated; full output: /tmp/dsh-subprocess-v5Resx/dsh-subprocess-882-1-69f2853ec1d3-stdout.log]\n\n' +
-  '(Omitted 48373 bytes. Full formatted result stored at: /tmp/dsh-spill-DELYH2/session-bd16ec674eb0/b22bfdc180c0-bash.txt. Use read with offset/limit, or grep this path to search within it.)'
+  'work line 1\nwork line 2\n\n[output truncated; full output: /tmp/dsh-subprocess-K3M7Q/dsh-subprocess-4217-2-9f3c1a7e5b02-stdout.log]\n\n' +
+  '(Omitted 48373 bytes. Full formatted result stored at: /tmp/dsh-spill-T8N2R/session-7c4e9b1a2d35/6a1f8d3c0b47-bash.txt. Use read with offset/limit, or grep this path to search within it.)'
 
 function oneResult(id: string, text: string): Session {
   const session = Session.create(id)
@@ -179,8 +181,30 @@ test('the host prose notice marks a real spill on both of its forms', () => {
   const results = toolResults(oneResult('spill-prose', PROSE_TAIL))
   assert.deepEqual(
     spillPathsOfEvent(results[0]!),
-    ['/tmp/dsh-subprocess-v5Resx/dsh-subprocess-882-1-69f2853ec1d3-stdout.log', '/tmp/dsh-spill-DELYH2/session-bd16ec674eb0/b22bfdc180c0-bash.txt'],
+    ['/tmp/dsh-subprocess-K3M7Q/dsh-subprocess-4217-2-9f3c1a7e5b02-stdout.log', '/tmp/dsh-spill-T8N2R/session-7c4e9b1a2d35/6a1f8d3c0b47-bash.txt'],
     `both sentences name a file, so both must be collected: ${JSON.stringify(spillPathsOfEvent(results[0]!))}`,
+  )
+})
+
+test('a GLOB or a parenthesis inside a real spill directory is not a spill either', () => {
+  // Round-17 review Q6: when `]` joined the character classes, `)` and `*` were dropped from the
+  // last segment, so `/tmp/dsh-spill-123/glob-*.txt` inside a real notice marked the row. A host
+  // spill file name never contains `*` or `)`, and neither does any path it can print — a name with
+  // them is a user glob or a shell artifact, so it must not promise bytes that were never written.
+  const odd = toolResults(oneResult(
+    'spill-glob',
+    '[output truncated; full output: /tmp/dsh-spill-123/glob-*.txt]\n' +
+      '(Omitted 10 bytes. Full formatted result stored at: /tmp/dsh-spill-123/odd).txt. Use read with offset/limit.)',
+  ))
+  assert.deepEqual(spillPathsOfEvent(odd[0]!), [], 'a name carrying `*` or `)` is not a file this host wrote')
+
+  // The same directory with a plain file name is still a real spill — the exclusion is the
+  // character, not the directory.
+  const plain = toolResults(oneResult('spill-plain', '[output truncated; full output: /tmp/dsh-spill-123/plain.txt]'))
+  assert.deepEqual(
+    spillPathsOfEvent(plain[0]!),
+    ['/tmp/dsh-spill-123/plain.txt'],
+    'the directory is real, so a plain name inside it still marks the row',
   )
 })
 
@@ -233,8 +257,8 @@ test('a prose notice inside a JSON string field is still found after parsing', (
 })
 
 test('a path followed immediately by another bracketed marker stops at the first bracket', () => {
-  const results = toolResults(oneResult('spill-bracket', '[output truncated; full output: /tmp/dsh-spill-ZZ/session-q/b22bfdc180c0-bash.txt][stderr] tail lines'))
-  assert.deepEqual(spillPathsOfEvent(results[0]!), ['/tmp/dsh-spill-ZZ/session-q/b22bfdc180c0-bash.txt'], 'the greedy class must not eat the `]` of the next marker (round-16 Q3.2)')
+  const results = toolResults(oneResult('spill-bracket', '[output truncated; full output: /tmp/dsh-spill-ZZ/session-q/6a1f8d3c0b47-bash.txt][stderr] tail lines'))
+  assert.deepEqual(spillPathsOfEvent(results[0]!), ['/tmp/dsh-spill-ZZ/session-q/6a1f8d3c0b47-bash.txt'], 'the greedy class must not eat the `]` of the next marker (round-16 Q3.2)')
 })
 
 test('a large tool result with no spill marker costs the scan nothing and marks nothing', () => {

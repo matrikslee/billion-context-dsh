@@ -14,6 +14,7 @@
  * @module billion-context-dsh/config
  */
 import { type Config } from 'acp-kernel';
+import { type FoldPricing } from './region.ts';
 /** The kernel-facing knobs shared by the nudge path and the compress tool. */
 export interface KernelConfigInput {
     readonly modelContextLimit: number;
@@ -23,6 +24,13 @@ export interface KernelConfigInput {
     readonly nudgeMaxContextLimitPct?: number;
     /** Emergency nudge threshold (bypasses per-turn dedup; capped at 3 injections per user turn — issue #108). Kernel default: 0.95. */
     readonly nudgeEmergencyThresholdPct?: number;
+    /**
+     * Working-set floor as a fraction of the effective window: a fold that leaves
+     * less than this stays flagged (range row) and is refused by `condense` unless
+     * forced. Default DEFAULT_FOLD_FLOOR_PCT (0.15); 0 disables the guard.
+     * Appendix D of arXiv 2611.05306 — see src/region.ts.
+     */
+    readonly foldFloorPct?: number;
     /** Any other acp-kernel Config override (the billion-context-pi escape hatch). */
     readonly coreOverrides?: Partial<Config>;
 }
@@ -31,4 +39,62 @@ export interface KernelConfigInput {
  * nudge thresholds (merged into the defaults, never replacing them wholesale)
  * and any additional `coreOverrides`.
  */
+/**
+ * Fold pricing for a composition: the working-set floor (window × foldFloorPct).
+ * There is NO reuse-floor term: measured 2026-11-15, post-fold `reused` is the
+ * rewrite point's token offset, not a block constant. An unset pct lands on
+ * DEFAULT_FOLD_FLOOR_PCT; pct 0 disables the working-set guard entirely.
+ */
+/**
+ * NOT one of the six hot-editable settings keys, deliberately. The six hot keys are
+ * pressure thresholds — changing them mid-session only changes when we ask. These
+ * two are PRICING inputs that appear in numbers already shown to the model (range-row
+ * fold costs, the `below floor` marks, the elected-span refusal); editing them
+ * mid-session would make the tool contradict its own earlier quotes, and adding them
+ * to the settings layer means declaring them volatile in AcpPluginConfigSchema,
+ * filtering the composition base, and extending the legacy-seam tests — a change in
+ * its own right, not a follow-up to this batch. Until then they are composition-row
+ * keys set per deployment, which is also where they belong: `foldFloorPct` is
+ * the working set that provider can hold. There is NO reuse-floor knob any more:
+ * measured 2026-11-15 the post-fold `reused` was 31,378 — the rewrite point's
+ * token offset, not a block-aligned constant — so a subtracted floor had no
+ * measurement behind it.
+ */
+/**
+ * The working-set floor is window x foldFloorPct, CLAMPED to 8K-16K tokens.
+ * A bare percentage is wrong in both directions: on a 262144 window 0.15 demands
+ * 39K resident, which together with the guarded rows at the tail squeezes the
+ * foldable window until the tool mostly refuses; on a 32K window it demands
+ * 4.8K, thinner than any workable working set (arXiv 2611.05306 Appendix D).
+ * The lower bound 8K is the paper peak band (7-9K). foldFloorPct 0 disables it.
+ */
+export declare const WORKING_SET_FLOOR_MIN_TOKENS = 8192;
+/**
+ * The ceiling is ONE KV BLOCK — literally KV_BLOCK_TOKENS, the granularity this
+ * engine's slot reports (measured 2026-11-14 as a common reused value; the 2026-11-15
+ * fold proved reused is NOT block-aligned, so it stays a floor choice and not a
+ * price constant). Keep it that way: an operator
+ * knob here would let someone tune the UNMEASURED half of the trade (fold
+ * frequency) with no comparator, which is exactly what the caveat below warns about.
+ * A bigger floor is paid on EVERY later request (deeper resident
+ * context slows decode: measured 69.9 tok/s at 16K, 58.1 at 127K, ≈ 0.0008 s per
+ * token over that range), while a smaller floor is paid once per EXTRA fold
+ * (16K vs 32K is ≈ N/32K extra folds at ~45 s each ≈ 0.0014 s per generated
+ * token). In a long session the per-request side wins, so the ceiling is 16K —
+ * twice the paper peak band. The fold-frequency term is DERIVED, NOT measured:
+ * the first long session should count folds per 100K tokens and revisit this.
+ * The counter-argument for a larger floor is that every fold also leaves a
+ * permanent un-foldable summary barrier, equally unquantified. That term is NOT
+ * in the break-even above: a fold counted as ~45 s really costs ~45 s plus one
+ * surface split that can never be folded again, so this arithmetic is biased
+ * TOWARD the larger floor and the 16K choice is the conservative reading.
+ */
+export declare const WORKING_SET_FLOOR_MAX_TOKENS = 16384;
+/**
+ * Smallest reclaim worth a permanent barrier once the election degrades below the
+ * floor (cross-review Q5): a 1K fold buys 1K of relief for one surface split that
+ * can never be folded again — the worst barrier-per-byte ratio possible.
+ */
+export declare const MIN_DEGRADED_FOLD_TOKENS = 4096;
+export declare function foldPricingFor(input: KernelConfigInput): FoldPricing;
 export declare function kernelConfigFor(input: KernelConfigInput): Config;

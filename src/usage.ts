@@ -174,8 +174,8 @@ const lastPaired = new WeakMap<Session, { billed: number; anchorSeq: number }>()
  * `surfaceOp: replace` splices its checkpoint/tombstone seq IN PLACE (region.ts documents
  * this), so the tail node can carry a seq LOWER than the log's newest event. And the newest
  * billed row can be an `assistant/attempt`, which is never a surface node at all. Taking the
- * surface tail alone let a pre-fold `attempt` (seq 105) look NEWER than an anchor set by a fold
- * that rewrote the head (surface tail still 104), pairing the two again — exactly the forgery
+ * surface tail alone let a pre-fold `attempt` whose seq sits BELOW the fold’s in-place checkpoint
+ * seq look NEWER than that anchor, pairing the two again — exactly the forgery
  * this dating exists to stop (round-13 review Q1/Q4, both halves).
  */
 function lastRecordedSeq(session: Session): number {

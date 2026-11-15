@@ -4,7 +4,8 @@
  * folding one makes the host re-inject it, so a model that follows the nudge
  * loops compress → re-inject → compress forever (live-measured: 20 of 43
  * compressions in a long session re-triggered an injection within 7 events;
- * reproduced live in session-8c15904e seq 8 → 53191).
+ * reproduced live, where folding the oldest copy re-triggered the injection tens of
+ * thousands of events later).
  *
  * Fix pieces under test:
  * - classifySurfaceEvent buckets host policy rows as 'instruction'

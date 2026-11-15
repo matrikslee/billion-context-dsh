@@ -1347,7 +1347,8 @@ export function newestSkillCatalogSeqOf(session: Session): number | null {
  *
  * EVIDENCE for the claim (rule 16, live-measured, not assumed): folding the
  * NEWEST copy re-triggered an injection within 7 events in 20 of 43 compressions
- * in a long session (session-8c15904e, seq 8 → re-injected at seq 53191); folding a
+ * in a long session (the oldest injected copy, folded near the head, came back tens of
+ * thousands of events later); folding a
  * superseded copy while the newest stayed visible produced no re-send. If a future
  * host ever re-emits an older copy, this becomes a silent deletion of a live
  * instruction with no error to notice — the fallback then is to offer no
@@ -1608,8 +1609,8 @@ function compressibleSegmentsOf(
       // host re-inject it on its next step — the tokens come straight back, and
       // a model that keeps compressing them loops forever (live-measured: 20 of
       // 43 compressions in a long session re-triggered an injection within 7
-      // events; observed again live in session-8c15904e, seq 8 absorbed by a
-      // compress → host re-injected at seq 53191). Stale copies stay barriers
+      // events; observed again live, where a compress that absorbed the oldest instruction
+      // row saw the host re-inject it tens of thousands of events later). Stale copies stay barriers
       // here too; the system-side GC that removes them lands separately
       // (instruction hygiene PR2). A SUPERSEDED copy cannot come back, so a caller
       // reclaiming a long session may opt in (foldStaleInstructionRows) and fold
@@ -1766,7 +1767,7 @@ export function buildCompressibleSeqRanges(
           // 2^14 KV block). The fixed request head — system prompt, tool registry,
           // injected rows — sits BEFORE any rewrite point, so it lives inside that
           // reused prefix and must NOT be added here. Measured the same day: two
-          // folds (rewrite points 17928 and 18137) billed 51,122 uncached tokens in
+          // folds at two DIFFERENT rewrite points billed 51,122 uncached tokens in
           // total afterwards, while the range table quoted ~92K for a row on the same
           // surface — the overhead term was the gap (round-10 review B1). The overhead
           // stays in the EMERGENCY fit check (src/index.ts), where the question is the

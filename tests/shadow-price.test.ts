@@ -6,7 +6,7 @@
  * every compaction claim to be derived from the SAME estimator. The engine's
  * old code priced claims with `defaultCountTokens` (CJK 1 char/token), which
  * overdraws the meter on CJK-heavy sessions and bricks them (live session
- * session-3aa366c3: accumulated 42,076 host-tokens, claimed 74,858 →
+ * the bricked session: accumulated 42,076 host-tokens, claimed 74,858 →
  * messageTokens ≈ −31K → the projection schema rejected every turn).
  *
  * Issue #103 is the SAME brick through a second channel: since DSH 0.1.2 the
